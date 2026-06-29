@@ -13,13 +13,13 @@ namespace SharpEmu.Libs.Kernel;
 public static class KernelPthreadExtendedCompatExports
 {
     private const int DefaultThreadPriority = 700;
-    private const ulong DefaultThreadAffinityMask = ulong.MaxValue;
+    private const ulong DefaultThreadAffinityMask = 0x7FUL;
     private const int DefaultDetachState = 0;
     private const ulong DefaultGuardSize = 0x1000UL;
     private const ulong DefaultStackSize = 0x1_00000UL;
-    private const int DefaultInheritSched = 0;
-    private const int DefaultSchedPolicy = 0;
-    private const int DefaultSchedPriority = 0;
+    private const int DefaultInheritSched = 4;
+    private const int DefaultSchedPolicy = 1;
+    private const int DefaultSchedPriority = DefaultThreadPriority;
     private const ulong SyntheticRwlockHandleBase = 0x00006003_0000_0000;
     private const ulong SyntheticPthreadAttrHandleBase = 0x00006004_0000_0000;
 
@@ -33,6 +33,48 @@ public static class KernelPthreadExtendedCompatExports
     private static long _nextSyntheticPthreadAttrHandleId = 1;
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
+
+    internal static void GetThreadStartScheduling(
+        CpuContext ctx,
+        ulong attrAddress,
+        out int priority,
+        out ulong affinityMask)
+    {
+        if (attrAddress == 0)
+        {
+            priority = DefaultThreadPriority;
+            affinityMask = DefaultThreadAffinityMask;
+            return;
+        }
+
+        var resolvedAddress = ResolvePthreadAttrHandle(ctx, attrAddress);
+        lock (_stateGate)
+        {
+            var attributes = GetOrCreateAttrStateLocked(resolvedAddress);
+            priority = attributes.SchedPriority;
+            affinityMask = attributes.AffinityMask;
+        }
+    }
+
+    internal static void RegisterThreadStart(
+        ulong thread,
+        string name,
+        int priority,
+        ulong affinityMask)
+    {
+        lock (_stateGate)
+        {
+            var state = GetOrCreateThreadStateLocked(thread);
+            state.Name = name;
+            state.Priority = priority;
+            state.AffinityMask = affinityMask;
+            state.Attributes = state.Attributes with
+            {
+                SchedPriority = priority,
+                AffinityMask = affinityMask,
+            };
+        }
+    }
 
     private sealed class ThreadState
     {

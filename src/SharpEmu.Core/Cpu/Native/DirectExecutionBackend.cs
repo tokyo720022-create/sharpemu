@@ -347,6 +347,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public string Name { get; init; } = string.Empty;
 
+		public int Priority { get; init; }
+
+		public ulong AffinityMask { get; init; }
+
 		public CpuContext Context { get; init; } = null!;
 
 		public GuestThreadRunState State { get; set; }
@@ -388,14 +392,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private Action? _work;
 		private volatile bool _stopping;
 
-		public GuestContinuationRunner(ulong guestThreadHandle)
+		public GuestContinuationRunner(ulong guestThreadHandle, ThreadPriority priority)
 		{
 			_guestThreadHandle = guestThreadHandle;
 			_thread = new Thread(ThreadMain)
 			{
 				IsBackground = true,
 				Name = $"GuestContinuation-{guestThreadHandle:X}",
-				Priority = ThreadPriority.BelowNormal,
+				Priority = priority,
 			};
 			_thread.Start();
 		}
@@ -2393,7 +2397,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Interlocked.Increment(ref _readyGuestThreadCount);
 		}
 		Console.Error.WriteLine(
-			$"[LOADER][INFO] Scheduled guest thread '{thread.Name}' handle=0x{thread.ThreadHandle:X16} entry=0x{thread.EntryPoint:X16} arg=0x{thread.Argument:X16}");
+			$"[LOADER][INFO] Scheduled guest thread '{thread.Name}' handle=0x{thread.ThreadHandle:X16} " +
+			$"entry=0x{thread.EntryPoint:X16} arg=0x{thread.Argument:X16} priority={thread.Priority} " +
+			$"host_priority={MapGuestThreadPriority(thread.Priority)} affinity=0x{thread.AffinityMask:X}");
 		Pump(creatorContext, "pthread_create");
 		return true;
 	}
@@ -2448,7 +2454,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					IsBackground = true,
 					Name = $"SharpEmu-{thread.Name}",
-					Priority = ThreadPriority.BelowNormal,
+					Priority = MapGuestThreadPriority(thread.Priority),
 				};
 				lock (_guestThreadGate)
 				{
@@ -2851,7 +2857,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			{
 				if (_guestThreads.TryGetValue(currentGuestThreadHandle, out var guestThread))
 				{
-					runner = guestThread.ContinuationRunner ??= new GuestContinuationRunner(currentGuestThreadHandle);
+					runner = guestThread.ContinuationRunner ??= new GuestContinuationRunner(
+						currentGuestThreadHandle,
+						MapGuestThreadPriority(guestThread.Priority));
 				}
 				else
 				{
@@ -2990,6 +2998,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			EntryPoint = request.EntryPoint,
 			Argument = request.Argument,
 			Name = string.IsNullOrWhiteSpace(request.Name) ? $"Thread-{request.ThreadHandle:X}" : request.Name,
+			Priority = request.Priority,
+			AffinityMask = request.AffinityMask,
 			Context = context,
 			State = GuestThreadRunState.Ready,
 		};
@@ -3129,11 +3139,77 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			context.TryWriteUInt64(tlsBase + 0x60, tlsBase);
 	}
 
+	private static ThreadPriority MapGuestThreadPriority(int priority)
+	{
+		if (priority <= 478)
+		{
+			return ThreadPriority.Highest;
+		}
+		if (priority >= 733)
+		{
+			return ThreadPriority.Lowest;
+		}
+
+		return ThreadPriority.Normal;
+	}
+
+	private void ApplyGuestThreadAffinity(ulong guestAffinityMask)
+	{
+		var hostAffinityMask = MapGuestThreadAffinity(guestAffinityMask);
+		if (hostAffinityMask == 0)
+		{
+			return;
+		}
+
+		if (SetThreadAffinityMask(GetCurrentThread(), (nuint)hostAffinityMask) == 0 && _logGuestThreads)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Failed to set guest thread affinity guest=0x{guestAffinityMask:X} " +
+				$"host=0x{hostAffinityMask:X} error={Marshal.GetLastWin32Error()}");
+		}
+	}
+
+	private static ulong MapGuestThreadAffinity(ulong guestAffinityMask)
+	{
+		if (guestAffinityMask == 0 || guestAffinityMask == ulong.MaxValue)
+		{
+			return 0;
+		}
+
+		var processorCount = Math.Min(Environment.ProcessorCount, 64);
+		if (processorCount == 0)
+		{
+			return 0;
+		}
+
+		ulong hostAffinityMask = 0;
+		for (var guestCpu = 0; guestCpu < 64; guestCpu++)
+		{
+			if ((guestAffinityMask & (1UL << guestCpu)) == 0)
+			{
+				continue;
+			}
+
+			var hostCpu = processorCount < 8
+				? guestCpu % processorCount
+				: processorCount >= 16
+					? guestCpu * 2
+					: guestCpu;
+			if (hostCpu < processorCount)
+			{
+				hostAffinityMask |= 1UL << hostCpu;
+			}
+		}
+
+		return hostAffinityMask;
+	}
+
 	private void RunGuestThread(GuestThreadState thread, string reason)
 	{
 		var previousLastError = LastError;
 		var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(thread.ThreadHandle);
 		var previousGuestThreadState = _activeGuestThreadState;
+		ApplyGuestThreadAffinity(thread.AffinityMask);
 		Volatile.Write(ref thread.HostThreadId, unchecked((int)GetCurrentThreadId()));
 		_activeGuestThreadState = thread;
 		try
@@ -3183,6 +3259,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
 						thread.BlockReason = blockReason;
+						if (thread.HasBlockedContinuation &&
+							thread.BlockWakeHandler is not null &&
+							thread.BlockWakeHandler())
+						{
+							thread.State = GuestThreadRunState.Ready;
+							thread.BlockReason = null;
+							thread.BlockWakeHandler = null;
+							thread.BlockDeadlineTimestamp = 0;
+							_readyGuestThreads.Enqueue(thread);
+							Interlocked.Increment(ref _readyGuestThreadCount);
+						}
 						break;
 					default:
 						thread.State = GuestThreadRunState.Faulted;
@@ -4143,6 +4230,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	[DllImport("kernel32.dll")]
 	private static extern uint GetCurrentThreadId();
+
+	[DllImport("kernel32.dll")]
+	private static extern nint GetCurrentThread();
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern nuint SetThreadAffinityMask(nint hThread, nuint dwThreadAffinityMask);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
 	private static extern nint OpenThread(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwThreadId);

@@ -10,7 +10,9 @@ public readonly record struct GuestThreadStartRequest(
     ulong EntryPoint,
     ulong Argument,
     ulong AttributeAddress,
-    string Name);
+    string Name,
+    int Priority,
+    ulong AffinityMask);
 
 public readonly record struct GuestThreadSnapshot(
     ulong ThreadHandle,

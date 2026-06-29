@@ -204,6 +204,16 @@ public static class KernelExports
         var nameAddress = ctx[CpuRegister.R8];
         var name = nameAddress == 0 ? string.Empty : ReadCString(ctx, nameAddress, 256);
         var threadHandle = KernelPthreadState.CreateThreadHandle(name);
+        KernelPthreadExtendedCompatExports.GetThreadStartScheduling(
+            ctx,
+            attrAddress,
+            out var priority,
+            out var affinityMask);
+        KernelPthreadExtendedCompatExports.RegisterThreadStart(
+            threadHandle,
+            name,
+            priority,
+            affinityMask);
         if (threadIdAddress != 0 && !ctx.TryWriteUInt64(threadIdAddress, threadHandle))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -212,13 +222,22 @@ public static class KernelExports
         if (ShouldTracePthread())
         {
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] pthread_create: out=0x{threadIdAddress:X16} attr=0x{attrAddress:X16} entry=0x{entryAddress:X16} arg=0x{argument:X16} name_ptr=0x{nameAddress:X16} name='{name}' -> thread=0x{threadHandle:X16}");
+                $"[LOADER][TRACE] pthread_create: out=0x{threadIdAddress:X16} attr=0x{attrAddress:X16} " +
+                $"entry=0x{entryAddress:X16} arg=0x{argument:X16} name_ptr=0x{nameAddress:X16} " +
+                $"name='{name}' priority={priority} affinity=0x{affinityMask:X} -> thread=0x{threadHandle:X16}");
         }
 
         var scheduler = GuestThreadExecution.Scheduler;
         if (scheduler is not null && entryAddress != 0)
         {
-            var request = new GuestThreadStartRequest(threadHandle, entryAddress, argument, attrAddress, name);
+            var request = new GuestThreadStartRequest(
+                threadHandle,
+                entryAddress,
+                argument,
+                attrAddress,
+                name,
+                priority,
+                affinityMask);
             if (!scheduler.TryStartThread(ctx, request, out var error))
             {
                 Console.Error.WriteLine(
