@@ -177,6 +177,7 @@ internal enum SpirvCapability : uint
     StorageImageReadWithoutFormat = 55,
     StorageImageWriteWithoutFormat = 56,
     GroupNonUniform = 61,
+    GroupNonUniformVote = 62,
     GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65,
     RuntimeDescriptorArray = 5302,

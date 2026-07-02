@@ -113,7 +113,8 @@ internal static class Gen5ShaderTranslator
         uint userDataBaseRegister,
         out Gen5ShaderState state,
         out string error,
-        Gen5ComputeSystemRegisters? computeSystemRegisters = null)
+        Gen5ComputeSystemRegisters? computeSystemRegisters = null,
+        uint userDataScalarRegisterBase = 0)
     {
         state = default!;
         if (!TryDecodeProgram(ctx, shaderAddress, out var program, out error))
@@ -134,7 +135,12 @@ internal static class Gen5ShaderTranslator
             shaderRegisters.TryGetValue(userDataBaseRegister + index, out userData[index]);
         }
 
-        state = new Gen5ShaderState(program, userData, metadata, computeSystemRegisters);
+        state = new Gen5ShaderState(
+            program,
+            userData,
+            metadata,
+            computeSystemRegisters,
+            userDataScalarRegisterBase);
         return true;
     }
 
@@ -179,7 +185,9 @@ internal static class Gen5ShaderTranslator
             : string.Empty;
         if (state.Metadata is not { } metadata)
         {
-            return $"ud[{userData}]{systemRegisters} metadata=missing";
+            return
+                $"ud_base=s{state.UserDataScalarRegisterBase} ud[{userData}]" +
+                $"{systemRegisters} metadata=missing";
         }
 
         var direct = string.Join(
@@ -191,7 +199,8 @@ internal static class Gen5ShaderTranslator
                 $"{resource.Kind}[{resource.Slot}]@{resource.OffsetDwords}" +
                 (resource.SizeFlag ? "+" : string.Empty)));
         return
-            $"ud[{userData}]{systemRegisters} metadata[eud={metadata.ExtendedUserDataSizeDwords}," +
+            $"ud_base=s{state.UserDataScalarRegisterBase} ud[{userData}]" +
+            $"{systemRegisters} metadata[eud={metadata.ExtendedUserDataSizeDwords}," +
             $"srt={metadata.ShaderResourceTableSizeDwords},direct={direct},resources={resources}]";
     }
 
@@ -668,9 +677,8 @@ internal static class Gen5ShaderTranslator
         error = string.Empty;
         name = opcode switch
         {
-            0x00 => "VCndmaskB32",
-            0x01 => "VReadlaneB32",
-            0x02 => "VWritelaneB32",
+            0x01 => "VCndmaskB32",
+            0x02 => "VDot2cF32F16",
             0x03 => "VAddF32",
             0x04 => "VSubF32",
             0x05 => "VSubrevF32",
@@ -810,7 +818,7 @@ internal static class Gen5ShaderTranslator
             }
             : opcode switch
         {
-            0x101 => "VReadlaneB32",
+            0x101 => "VCndmaskB32",
             0x103 => "VAddF32",
             0x104 => "VSubF32",
             0x108 => "VMulF32",
@@ -1246,17 +1254,16 @@ internal static class Gen5ShaderTranslator
                 var scalarOffset = (extra >> 25) & 0x7F;
                 var offset = SignExtend(extra & 0x1FFFFF, 21);
                 var count = ScalarLoadDwordCount(opcode);
-                var dynamicOffsetRegister = scalarOffset <= 105 || scalarOffset == 124
-                    ? scalarOffset
-                    : (uint?)null;
-                sources = dynamicOffsetRegister.HasValue
-                    ? [Gen5Operand.Scalar(scalarBase), Gen5Operand.Scalar(dynamicOffsetRegister.Value)]
-                    : [Gen5Operand.Scalar(scalarBase)];
+                sources =
+                [
+                    Gen5Operand.Scalar(scalarBase),
+                    Gen5Operand.Scalar(scalarOffset),
+                ];
                 destinations = Enumerable
                     .Range((int)scalarDestination, checked((int)count))
                     .Select(index => Gen5Operand.Scalar((uint)index))
                     .ToArray();
-                control = new Gen5ScalarMemoryControl(count, offset, dynamicOffsetRegister);
+                control = new Gen5ScalarMemoryControl(count, offset, scalarOffset);
                 break;
             }
             case Gen5ShaderEncoding.Vop1:

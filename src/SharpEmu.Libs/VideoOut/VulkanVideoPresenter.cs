@@ -66,6 +66,7 @@ internal sealed record VulkanOffscreenGuestDraw(
     bool PublishTarget);
 
 internal sealed record VulkanComputeGuestDispatch(
+    ulong ShaderAddress,
     byte[] ComputeSpirv,
     IReadOnlyList<VulkanGuestDrawTexture> Textures,
     IReadOnlyList<VulkanGuestMemoryBuffer> GlobalMemoryBuffers,
@@ -434,6 +435,7 @@ internal static unsafe class VulkanVideoPresenter
     }
 
     public static void SubmitComputeDispatch(
+        ulong shaderAddress,
         byte[] computeSpirv,
         IReadOnlyList<VulkanGuestDrawTexture> textures,
         IReadOnlyList<VulkanGuestMemoryBuffer> globalMemoryBuffers,
@@ -459,6 +461,7 @@ internal static unsafe class VulkanVideoPresenter
 
             EnqueueGuestWorkLocked(
                 new VulkanComputeGuestDispatch(
+                    shaderAddress,
                     computeSpirv,
                     textures.ToArray(),
                     globalMemoryBuffers.ToArray(),
@@ -845,7 +848,8 @@ internal static unsafe class VulkanVideoPresenter
             Fence Fence,
             CommandBuffer CommandBuffer,
             TranslatedDrawResources Resources,
-            IReadOnlyList<GuestImageResource> TraceImages);
+            IReadOnlyList<GuestImageResource> TraceImages,
+            string DebugName);
 
         public Presenter(uint width, uint height)
         {
@@ -1056,8 +1060,10 @@ internal static unsafe class VulkanVideoPresenter
         {
             var storage = dispatch.Textures.FirstOrDefault(texture => texture.IsStorage && texture.Address != 0);
             return storage is null
-                ? $"SharpEmu compute {dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ}"
-                : $"SharpEmu compute storage=0x{storage.Address:X16} " +
+                ? $"SharpEmu compute cs=0x{dispatch.ShaderAddress:X16} " +
+                  $"{dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ}"
+                : $"SharpEmu compute cs=0x{dispatch.ShaderAddress:X16} " +
+                  $"storage=0x{storage.Address:X16} " +
                   $"{storage.Width}x{storage.Height} fmt{storage.Format} " +
                   $"{dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ}";
         }
@@ -1365,7 +1371,8 @@ internal static unsafe class VulkanVideoPresenter
                     fence,
                     commandBuffer,
                     resources,
-                    traceImages));
+                    traceImages,
+                    resources.DebugName));
         }
 
         private void EnsureGuestSubmissionCapacity()
@@ -1382,14 +1389,13 @@ internal static unsafe class VulkanVideoPresenter
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
             {
                 var fence = oldest.Fence;
-                Check(
-                    _vk.WaitForFences(
-                        _device,
-                        1,
-                        &fence,
-                        true,
-                        ulong.MaxValue),
-                    "vkWaitForFences(guest)");
+                var result = _vk.WaitForFences(
+                    _device,
+                    1,
+                    &fence,
+                    true,
+                    ulong.MaxValue);
+                Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
             }
 
             while (_pendingGuestSubmissions.TryPeek(out var submission))
@@ -1400,7 +1406,7 @@ internal static unsafe class VulkanVideoPresenter
                     break;
                 }
 
-                Check(status, "vkGetFenceStatus(guest)");
+                Check(status, $"vkGetFenceStatus(guest: {submission.DebugName})");
                 _pendingGuestSubmissions.Dequeue();
 
                 foreach (var image in submission.TraceImages)
@@ -2156,6 +2162,13 @@ internal static unsafe class VulkanVideoPresenter
                     AttachmentCount = 1,
                     PAttachments = &colorBlendAttachment,
                 };
+                var dynamicStateValue = DynamicState.Scissor;
+                var dynamicState = new PipelineDynamicStateCreateInfo
+                {
+                    SType = StructureType.PipelineDynamicStateCreateInfo,
+                    DynamicStateCount = 1,
+                    PDynamicStates = &dynamicStateValue,
+                };
                 var pipelineInfo = new GraphicsPipelineCreateInfo
                 {
                     SType = StructureType.GraphicsPipelineCreateInfo,
@@ -2167,6 +2180,7 @@ internal static unsafe class VulkanVideoPresenter
                     PRasterizationState = &rasterization,
                     PMultisampleState = &multisample,
                     PColorBlendState = &colorBlend,
+                    PDynamicState = &dynamicState,
                     Layout = resources.PipelineLayout,
                     RenderPass = renderPass,
                     Subpass = 0,
@@ -2893,11 +2907,7 @@ internal static unsafe class VulkanVideoPresenter
                         null);
                 }
 
-                _vk.CmdDispatch(
-                    _commandBuffer,
-                    work.GroupCountX,
-                    work.GroupCountY,
-                    work.GroupCountZ);
+                RecordChunkedComputeDispatch(_commandBuffer, work);
                 RecordStorageImagesForRead(resources, PipelineStageFlags.ComputeShaderBit);
                 EndDebugLabel(_commandBuffer);
 
@@ -2911,7 +2921,7 @@ internal static unsafe class VulkanVideoPresenter
                 TraceVulkanShader(
                     $"vk.compute_dispatch groups={work.GroupCountX}x" +
                     $"{work.GroupCountY}x{work.GroupCountZ} " +
-                    $"textures={work.Textures.Count}");
+                    $"textures={work.Textures.Count} cs=0x{work.ShaderAddress:X16}");
             }
             catch (Exception exception)
             {
@@ -2934,6 +2944,44 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     DestroyTranslatedDrawResources(resources);
                 }
+            }
+        }
+
+        private void RecordChunkedComputeDispatch(
+            CommandBuffer commandBuffer,
+            VulkanComputeGuestDispatch work)
+        {
+            const uint maxWorkgroupsPerCommand = 4096;
+            var yChunk = Math.Max(
+                1u,
+                Math.Min(
+                    work.GroupCountY,
+                    maxWorkgroupsPerCommand / Math.Max(work.GroupCountX, 1u)));
+            var commandCount = 0u;
+
+            for (var z = 0u; z < work.GroupCountZ; z++)
+            {
+                for (var y = 0u; y < work.GroupCountY; y += yChunk)
+                {
+                    var countY = Math.Min(yChunk, work.GroupCountY - y);
+                    _vk.CmdDispatchBase(
+                        commandBuffer,
+                        0,
+                        y,
+                        z,
+                        work.GroupCountX,
+                        countY,
+                        1);
+                    commandCount++;
+                }
+            }
+
+            if (commandCount > 1)
+            {
+                TraceVulkanShader(
+                    $"vk.compute_chunked cs=0x{work.ShaderAddress:X16} " +
+                    $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                    $"commands={commandCount} y_chunk={yChunk}");
             }
         }
 
@@ -4294,29 +4342,51 @@ internal static unsafe class VulkanVideoPresenter
                     null);
             }
 
-            if (resources.IndexBuffer.Handle != 0)
+            const uint maxPixelsPerDraw = 512 * 512;
+            var rowsPerDraw = Math.Max(
+                1u,
+                Math.Min(extent.Height, maxPixelsPerDraw / Math.Max(extent.Width, 1u)));
+            var drawCount = 0u;
+            for (var y = 0u; y < extent.Height; y += rowsPerDraw)
             {
-                _vk.CmdBindIndexBuffer(
-                    _commandBuffer,
-                    resources.IndexBuffer,
-                    0,
-                    resources.Index32Bit ? IndexType.Uint32 : IndexType.Uint16);
-                _vk.CmdDrawIndexed(
-                    _commandBuffer,
-                    resources.VertexCount,
-                    resources.InstanceCount,
-                    0,
-                    0,
-                    0);
+                var scissor = new Rect2D(
+                    new Offset2D(0, checked((int)y)),
+                    new Extent2D(extent.Width, Math.Min(rowsPerDraw, extent.Height - y)));
+                _vk.CmdSetScissor(_commandBuffer, 0, 1, &scissor);
+
+                if (resources.IndexBuffer.Handle != 0)
+                {
+                    _vk.CmdBindIndexBuffer(
+                        _commandBuffer,
+                        resources.IndexBuffer,
+                        0,
+                        resources.Index32Bit ? IndexType.Uint32 : IndexType.Uint16);
+                    _vk.CmdDrawIndexed(
+                        _commandBuffer,
+                        resources.VertexCount,
+                        resources.InstanceCount,
+                        0,
+                        0,
+                        0);
+                }
+                else
+                {
+                    _vk.CmdDraw(
+                        _commandBuffer,
+                        resources.VertexCount,
+                        resources.InstanceCount,
+                        0,
+                        0);
+                }
+
+                drawCount++;
             }
-            else
+
+            if (drawCount > 1)
             {
-                _vk.CmdDraw(
-                    _commandBuffer,
-                    resources.VertexCount,
-                    resources.InstanceCount,
-                    0,
-                    0);
+                TraceVulkanShader(
+                    $"vk.graphics_chunked target={extent.Width}x{extent.Height} " +
+                    $"draws={drawCount} rows={rowsPerDraw} name={resources.DebugName}");
             }
             _vk.CmdEndRenderPass(_commandBuffer);
         }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
 using System.Buffers.Binary;
 using System.Numerics;
 
@@ -45,9 +46,13 @@ internal static class Gen5ShaderScalarEvaluator
         evaluation = default!;
         error = string.Empty;
         var scalarRegisters = new uint[ScalarRegisterCount];
-        for (var index = 0; index < state.UserData.Count && index < scalarRegisters.Length; index++)
+        for (var index = 0;
+             index < state.UserData.Count &&
+             state.UserDataScalarRegisterBase + (uint)index < scalarRegisters.Length;
+             index++)
         {
-            scalarRegisters[index] = state.UserData[index];
+            scalarRegisters[state.UserDataScalarRegisterBase + (uint)index] =
+                state.UserData[index];
         }
 
         if (state.ComputeSystemRegisters is { } computeSystemRegisters)
@@ -259,10 +264,16 @@ internal static class Gen5ShaderScalarEvaluator
                             bufferDescriptor.SizeBytes,
                             out var data))
                     {
+                        var descriptorWords = string.Join(
+                            ':',
+                            Enumerable.Range(0, 4).Select(index =>
+                                $"{scalarRegisters[bufferMemory.ScalarResource + (uint)index]:X8}"));
                         error =
                             $"buffer-memory-read-failed pc=0x{instruction.Pc:X} " +
                             $"address=0x{bufferDescriptor.BaseAddress:X16} " +
-                            $"bytes={bufferDescriptor.SizeBytes}";
+                            $"bytes={bufferDescriptor.SizeBytes} " +
+                            $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords} " +
+                            $"s{bufferMemory.ScalarResource}=[{descriptorWords}]";
                         return false;
                     }
 
@@ -471,10 +482,22 @@ internal static class Gen5ShaderScalarEvaluator
             return false;
         }
 
-        data = GC.AllocateUninitializedArray<byte>((int)cappedSize);
-        if (ctx.Memory.TryRead(baseAddress, data))
+        var candidateSize = (int)cappedSize;
+        while (candidateSize >= sizeof(uint))
         {
-            return true;
+            data = GC.AllocateUninitializedArray<byte>(candidateSize);
+            if (ctx.Memory.TryRead(baseAddress, data) ||
+                KernelMemoryCompatExports.TryReadTrackedLibcHeap(baseAddress, data))
+            {
+                return true;
+            }
+
+            if (candidateSize == sizeof(uint))
+            {
+                break;
+            }
+
+            candidateSize = Math.Max(candidateSize / 2, sizeof(uint));
         }
 
         data = [];
@@ -577,6 +600,49 @@ internal static class Gen5ShaderScalarEvaluator
             value = instruction.Opcode == "SLshlB64"
                 ? value << ((int)shift & 63)
                 : value >> ((int)shift & 63);
+            WriteScalarPair(registers, destination.Value, value, ref execMask);
+            scalarConditionCode = value != 0;
+            return true;
+        }
+
+        if (instruction.Opcode is "SBfeU64" or "SBfeI64")
+        {
+            if (instruction.Sources.Count < 2 ||
+                destination.Value >= ScalarRegisterCount - 1 ||
+                !TryEvaluateScalarOperand64(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    out var source) ||
+                !TryEvaluateScalarOperand(
+                    instruction.Sources[1],
+                    registers,
+                    out var control))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            var offset = (int)control & 63;
+            var width = Math.Min(((int)control >> 16) & 0x7F, 64 - offset);
+            ulong value;
+            if (width == 0)
+            {
+                value = 0;
+            }
+            else
+            {
+                value = source >> offset;
+                if (width < 64)
+                {
+                    value &= ulong.MaxValue >> (64 - width);
+                    if (instruction.Opcode == "SBfeI64")
+                    {
+                        value = unchecked((ulong)((long)(value << (64 - width)) >> (64 - width)));
+                    }
+                }
+            }
+
             WriteScalarPair(registers, destination.Value, value, ref execMask);
             scalarConditionCode = value != 0;
             return true;

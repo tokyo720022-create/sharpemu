@@ -38,7 +38,9 @@ internal static partial class Gen5SpirvTranslator
                     break;
                 case "VCndmaskB32":
                 {
-                    var condition = Load(_boolType, _vcc);
+                    var condition = instruction.Sources.Count > 2
+                        ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                        : Load(_boolType, _vcc);
                     result = _module.AddInstruction(
                         SpirvOp.Select,
                         _uintType,
@@ -857,7 +859,7 @@ internal static partial class Gen5SpirvTranslator
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
 
-            Store(_vcc, condition);
+            StoreWaveMask(106, condition);
             if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
             {
                 var active = _module.AddInstruction(
@@ -865,7 +867,7 @@ internal static partial class Gen5SpirvTranslator
                     _boolType,
                     Load(_boolType, _exec),
                     condition);
-                Store(_exec, active);
+                StoreWaveMask(126, active);
             }
 
             return true;
@@ -930,7 +932,7 @@ internal static partial class Gen5SpirvTranslator
             }
 
             if (instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ||
-                instruction.Opcode == "SWqmB64")
+                instruction.Opcode is "SWqmB64" or "SBfeU64" or "SBfeI64")
             {
                 return TryEmitScalar64(instruction, destination, out error);
             }
@@ -1312,7 +1314,7 @@ internal static partial class Gen5SpirvTranslator
             var left = GetRawSource64(instruction, 0);
             if (instruction.Opcode.EndsWith("SaveexecB64", StringComparison.Ordinal))
             {
-                var oldExec = LoadS64(126);
+                var oldExec = BooleanToLaneMask(Load(_boolType, _exec));
                 var notLeft = _module.AddInstruction(SpirvOp.Not, _ulongType, left);
                 var newExec = instruction.Opcode switch
                 {
@@ -1345,7 +1347,6 @@ internal static partial class Gen5SpirvTranslator
 
                 StoreS64(destination, oldExec);
                 StoreS64(126, newExec);
-                Store(_exec, IsNotZero64(newExec));
                 Store(_scc, IsNotZero64(newExec));
                 return true;
             }
@@ -1371,6 +1372,49 @@ internal static partial class Gen5SpirvTranslator
                     shift);
                 StoreS64(destination, shiftedValue);
                 Store(_scc, IsNotZero64(shiftedValue));
+                return true;
+            }
+
+            if (instruction.Opcode is "SBfeU64" or "SBfeI64")
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit bitfield source";
+                    return false;
+                }
+
+                var control = GetRawSource(instruction, 1);
+                var offset = BitwiseAnd(control, UInt(63));
+                var requestedWidth = BitwiseAnd(
+                    ShiftRightLogical(control, UInt(16)),
+                    UInt(0x7F));
+                var remaining = _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _uintType,
+                    UInt(64),
+                    offset);
+                var width = Ext(
+                    38,
+                    _uintType,
+                    requestedWidth,
+                    remaining);
+                var extracted = instruction.Opcode == "SBfeI64"
+                    ? Bitcast(
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _longType,
+                            Bitcast(_longType, left),
+                            offset,
+                            width))
+                    : _module.AddInstruction(
+                        SpirvOp.BitFieldUExtract,
+                        _ulongType,
+                        left,
+                        offset,
+                        width);
+                StoreS64(destination, extracted);
+                Store(_scc, IsNotZero64(extracted));
                 return true;
             }
 
@@ -1451,11 +1495,6 @@ internal static partial class Gen5SpirvTranslator
             }
 
             StoreS64(destination, value);
-            if (destination == 126)
-            {
-                Store(_exec, IsNotZero64(value));
-            }
-
             return true;
         }
 
@@ -1472,14 +1511,6 @@ internal static partial class Gen5SpirvTranslator
             uint value = operand.Kind switch
             {
                 Gen5OperandKind.VectorRegister => LoadV(operand.Value),
-                Gen5OperandKind.ScalarRegister when operand.Value == 106 =>
-                    _module.AddInstruction(
-                        SpirvOp.Select,
-                        _uintType,
-                        Load(_boolType, _vcc),
-                        UInt(1),
-                        UInt(0)),
-                Gen5OperandKind.ScalarRegister when operand.Value == 107 => UInt(0),
                 Gen5OperandKind.ScalarRegister => LoadS(operand.Value),
                 Gen5OperandKind.LiteralConstant => UInt(operand.Value),
                 Gen5OperandKind.EncodedConstant when TryDecodeInlineConstant(
@@ -1881,7 +1912,7 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, partial, left),
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, result, partial));
-            Store(_vcc, carry);
+            StoreWaveMask(106, carry);
             return result;
         }
 
@@ -1912,7 +1943,7 @@ internal static partial class Gen5SpirvTranslator
                     _boolType,
                     partial,
                     borrowIn));
-            Store(_vcc, borrow);
+            StoreWaveMask(106, borrow);
             return result;
         }
 
@@ -1932,13 +1963,13 @@ internal static partial class Gen5SpirvTranslator
                         UInt(0)));
                 if (register == 106)
                 {
-                    Store(_vcc, carry);
+                    StoreWaveMask(106, carry);
                 }
 
                 return;
             }
 
-            Store(_vcc, carry);
+            StoreWaveMask(106, carry);
         }
 
         private uint EmitPermlane16(

@@ -102,6 +102,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _boolType;
         private uint _uintType;
         private uint _intType;
+        private uint _longType;
         private uint _ulongType;
         private uint _floatType;
         private uint _vec2Type;
@@ -297,10 +298,18 @@ internal static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
-            if (UsesSubgroupShuffle())
+            if (UsesSubgroupOperations())
             {
                 _module.AddCapability(SpirvCapability.GroupNonUniform);
-                _module.AddCapability(SpirvCapability.GroupNonUniformShuffle);
+                if (UsesSubgroupShuffle())
+                {
+                    _module.AddCapability(SpirvCapability.GroupNonUniformShuffle);
+                }
+
+                if (UsesWaveControl())
+                {
+                    _module.AddCapability(SpirvCapability.GroupNonUniformVote);
+                }
             }
 
             _glsl = _module.ImportExtInst("GLSL.std.450");
@@ -308,6 +317,7 @@ internal static partial class Gen5SpirvTranslator
             _boolType = _module.TypeBool();
             _uintType = _module.TypeInt(32, signed: false);
             _intType = _module.TypeInt(32, signed: true);
+            _longType = _module.TypeInt(64, signed: true);
             _ulongType = _module.TypeInt(64, signed: false);
             _floatType = _module.TypeFloat(32);
             _vec2Type = _module.TypeVector(_floatType, 2);
@@ -557,7 +567,7 @@ internal static partial class Gen5SpirvTranslator
 
         private void DeclareStageInterface()
         {
-            if (UsesSubgroupShuffle())
+            if (UsesSubgroupOperations())
             {
                 var subgroupPointer =
                     _module.TypePointer(SpirvStorageClass.Input, _uintType);
@@ -706,8 +716,16 @@ internal static partial class Gen5SpirvTranslator
             }
 
             Store(_scc, _module.ConstantBool(false));
-            Store(_vcc, _module.ConstantBool(false));
-            Store(_exec, _module.ConstantBool(true));
+            if (_subgroupInvocationIdInput != 0)
+            {
+                StoreWaveMask(106, _module.ConstantBool(false));
+                StoreWaveMask(126, _module.ConstantBool(true));
+            }
+            else
+            {
+                Store(_vcc, _module.ConstantBool(false));
+                Store(_exec, _module.ConstantBool(true));
+            }
             Store(_programCounter, UInt(0));
             Store(_programActive, _module.ConstantBool(true));
 
@@ -923,10 +941,10 @@ internal static partial class Gen5SpirvTranslator
             {
                 "SCbranchScc0" => LogicalNot(Load(_boolType, _scc)),
                 "SCbranchScc1" => Load(_boolType, _scc),
-                "SCbranchVccz" => LogicalNot(Load(_boolType, _vcc)),
-                "SCbranchVccnz" => Load(_boolType, _vcc),
-                "SCbranchExecz" => LogicalNot(Load(_boolType, _exec)),
-                "SCbranchExecnz" => Load(_boolType, _exec),
+                "SCbranchVccz" => LogicalNot(SubgroupAny(Load(_boolType, _vcc))),
+                "SCbranchVccnz" => SubgroupAny(Load(_boolType, _vcc)),
+                "SCbranchExecz" => LogicalNot(SubgroupAny(Load(_boolType, _exec))),
+                "SCbranchExecnz" => SubgroupAny(Load(_boolType, _exec)),
                 _ => 0,
             };
             return condition != 0;
@@ -1297,30 +1315,39 @@ internal static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode == "BufferAtomicAdd")
             {
-                var original = _module.AddInstruction(
-                    SpirvOp.AtomicIAdd,
-                    _uintType,
-                    BufferWordPointer(bindingIndex, dwordAddress),
-                    UInt(1),
-                    UInt(0x48),
-                    LoadV(control.VectorData));
-                if (control.Glc)
+                EmitExecConditional(() =>
                 {
-                    StoreV(control.VectorData, original);
-                }
+                    var original = _module.AddInstruction(
+                        SpirvOp.AtomicIAdd,
+                        _uintType,
+                        BufferWordPointer(bindingIndex, dwordAddress),
+                        UInt(1),
+                        UInt(0x48),
+                        LoadV(control.VectorData));
+                    if (control.Glc)
+                    {
+                        StoreV(control.VectorData, original);
+                    }
+                });
 
                 return true;
             }
 
             if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal))
             {
-                for (uint index = 0; index < control.DwordCount; index++)
+                EmitExecConditional(() =>
                 {
-                    var address = index == 0
-                        ? dwordAddress
-                        : IAdd(dwordAddress, UInt(index));
-                    StoreBufferWord(bindingIndex, address, LoadV(control.VectorData + index));
-                }
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        var address = index == 0
+                            ? dwordAddress
+                            : IAdd(dwordAddress, UInt(index));
+                        StoreBufferWord(
+                            bindingIndex,
+                            address,
+                            LoadV(control.VectorData + index));
+                    }
+                });
 
                 return true;
             }
@@ -1449,11 +1476,12 @@ internal static partial class Gen5SpirvTranslator
                 }
                 else
                 {
-                    _module.AddStatement(
-                        SpirvOp.ImageWrite,
-                        imageObject,
-                        coordinates,
-                        texel);
+                    EmitExecConditional(
+                        () => _module.AddStatement(
+                            SpirvOp.ImageWrite,
+                            imageObject,
+                            coordinates,
+                            texel));
                 }
 
                 return true;
@@ -1774,6 +1802,11 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 lowerInRange,
                 upperInRange);
+            inRange = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                Load(_boolType, _exec),
+                inRange);
             var writeLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
             _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
@@ -1900,6 +1933,12 @@ internal static partial class Gen5SpirvTranslator
                     SpirvOp.CompositeConstruct,
                     outputType,
                     values);
+                vector = _module.AddInstruction(
+                    SpirvOp.Select,
+                    outputType,
+                    Load(_boolType, _exec),
+                    vector,
+                    Load(outputType, _pixelOutput));
                 Store(_pixelOutput, vector);
                 return true;
             }
@@ -1945,6 +1984,12 @@ internal static partial class Gen5SpirvTranslator
                 SpirvOp.CompositeConstruct,
                 _vec4Type,
                 components);
+            outputValue = _module.AddInstruction(
+                SpirvOp.Select,
+                _vec4Type,
+                Load(_boolType, _exec),
+                outputValue,
+                Load(_vec4Type, outputVariable));
             Store(outputVariable, outputValue);
             return true;
         }
@@ -2009,7 +2054,23 @@ internal static partial class Gen5SpirvTranslator
 
         private uint LoadV(uint register) => Load(_uintType, VectorPointer(register));
 
-        private void StoreS(uint register, uint value) => Store(ScalarPointer(register), value);
+        private void StoreS(uint register, uint value)
+        {
+            Store(ScalarPointer(register), value);
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return;
+            }
+
+            if (register is 106 or 107)
+            {
+                Store(_vcc, IsCurrentLaneSet(LoadS64(106)));
+            }
+            else if (register is 126 or 127)
+            {
+                Store(_exec, IsCurrentLaneSet(LoadS64(126)));
+            }
+        }
 
         private void StoreV(uint register, uint value, bool guardWithExec = true)
         {
@@ -2059,6 +2120,61 @@ internal static partial class Gen5SpirvTranslator
         private uint LogicalNot(uint value) =>
             _module.AddInstruction(SpirvOp.LogicalNot, _boolType, value);
 
+        private uint SubgroupAny(uint condition) =>
+            _module.AddInstruction(
+                SpirvOp.GroupNonUniformAny,
+                _boolType,
+                UInt(3),
+                condition);
+
+        private uint CurrentLaneBit()
+        {
+            var lane = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _ulongType,
+                Load(_uintType, _subgroupInvocationIdInput));
+            return _module.AddInstruction(
+                SpirvOp.ShiftLeftLogical,
+                _ulongType,
+                _module.Constant64(_ulongType, 1),
+                lane);
+        }
+
+        private uint BooleanToLaneMask(uint condition) =>
+            _module.AddInstruction(
+                SpirvOp.Select,
+                _ulongType,
+                condition,
+                CurrentLaneBit(),
+                _module.Constant64(_ulongType, 0));
+
+        private uint IsCurrentLaneSet(uint mask) =>
+            IsNotZero64(
+                _module.AddInstruction(
+                    SpirvOp.BitwiseAnd,
+                    _ulongType,
+                    mask,
+                    CurrentLaneBit()));
+
+        private void StoreWaveMask(uint register, uint condition) =>
+            StoreS64(register, BooleanToLaneMask(condition));
+
+        private void EmitExecConditional(Action emit)
+        {
+            var activeLabel = _module.AllocateId();
+            var mergeLabel = _module.AllocateId();
+            _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
+            _module.AddStatement(
+                SpirvOp.BranchConditional,
+                Load(_boolType, _exec),
+                activeLabel,
+                mergeLabel);
+            _module.AddLabel(activeLabel);
+            emit();
+            _module.AddStatement(SpirvOp.Branch, mergeLabel);
+            _module.AddLabel(mergeLabel);
+        }
+
         private bool UsesLds() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DataShareControl);
@@ -2066,6 +2182,22 @@ internal static partial class Gen5SpirvTranslator
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32");
+
+        private bool UsesWaveControl() =>
+            _state.Program.Instructions.Any(instruction =>
+                instruction.Opcode.Contains("Saveexec", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("SCbranchExec", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("SCbranchVcc", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("VCmpx", StringComparison.Ordinal) ||
+                instruction.Sources.Any(IsWaveMaskOperand) ||
+                instruction.Destinations.Any(IsWaveMaskOperand));
+
+        private bool UsesSubgroupOperations() =>
+            UsesSubgroupShuffle() || UsesWaveControl();
+
+        private static bool IsWaveMaskOperand(Gen5Operand operand) =>
+            operand.Kind == Gen5OperandKind.ScalarRegister &&
+            operand.Value is 106 or 107 or 126 or 127;
 
         private static bool TryGetVectorDestination(
             Gen5ShaderInstruction instruction,

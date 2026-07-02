@@ -131,7 +131,8 @@ internal sealed record Gen5ShaderState(
     Gen5ShaderProgram Program,
     IReadOnlyList<uint> UserData,
     Gen5ShaderMetadata? Metadata,
-    Gen5ComputeSystemRegisters? ComputeSystemRegisters = null);
+    Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
+    uint UserDataScalarRegisterBase = 0);
 
 internal readonly record struct Gen5Operand(Gen5OperandKind Kind, uint Value)
 {

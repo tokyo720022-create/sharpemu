@@ -77,8 +77,11 @@ public static class AgcExports
     private const uint CbColor0Attrib3 = 0x3B8;
     private const int ColorTargetCount = 8;
     private const uint PsTextureUserDataRegister = 0xC;
+    private const uint VsUserDataRegister = 0x4C;
+    private const uint GsUserDataRegister = 0x8C;
     private const uint EsUserDataRegister = 0xCC;
     private const uint ComputeUserDataRegister = 0x240;
+    private const uint NggUserDataScalarRegisterBase = 8;
     private const uint Gen5TextureFormatR8G8B8A8Unorm = 56;
     private const uint Gen5TextureFormatR16G16B16A16Float = 71;
     private const uint Gen5TextureType2D = 9;
@@ -2873,9 +2876,10 @@ public static class AgcExports
                 exportShaderAddress,
                 exportShaderHeader,
                 state.ShRegisters,
-                EsUserDataRegister,
+                SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
-                out error) ||
+                out error,
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 exportState,
@@ -2904,11 +2908,13 @@ public static class AgcExports
                 HasPixelColorExport(pixelState, target.Slot))
             .ToArray();
         var outputKind = GetPixelOutputKind(renderTargets.FirstOrDefault().NumberType);
+        var exportStateFingerprint = ComputeShaderStateFingerprint(exportEvaluation);
+        var pixelStateFingerprint = ComputeShaderStateFingerprint(pixelEvaluation);
         var shaderKey = (
             exportShaderAddress,
-            ComputeShaderStateFingerprint(exportEvaluation),
+            exportStateFingerprint,
             pixelShaderAddress,
-            ComputeShaderStateFingerprint(pixelEvaluation),
+            pixelStateFingerprint,
             outputKind);
         (byte[] Vertex, byte[] Pixel) compiled;
         lock (_submitTraceGate)
@@ -2943,6 +2949,18 @@ public static class AgcExports
             }
 
             compiled = (vertexShader.Spirv, pixelShader.Spirv);
+            DumpSpirv(
+                "vs",
+                exportShaderAddress,
+                exportStateFingerprint,
+                compiled.Vertex,
+                exportState.Program);
+            DumpSpirv(
+                "ps",
+                pixelShaderAddress,
+                pixelStateFingerprint,
+                compiled.Pixel,
+                pixelState.Program);
             lock (_submitTraceGate)
             {
                 _graphicsSpirvCache.TryAdd(shaderKey, compiled);
@@ -3004,7 +3022,9 @@ public static class AgcExports
         var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
         var byteCount = checked((int)(indexCount * (uint)bytesPerIndex));
         var data = new byte[byteCount];
-        return ctx.Memory.TryRead(state.IndexBufferAddress + byteOffset, data)
+        var address = state.IndexBufferAddress + byteOffset;
+        return (ctx.Memory.TryRead(address, data) ||
+                KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, data))
             ? new VulkanGuestIndexBuffer(data, is32Bit)
             : null;
     }
@@ -3144,12 +3164,22 @@ public static class AgcExports
                     $"fmt{texture.Format}/num{texture.NumberType}/tile{texture.TileMode}" +
                     $"/storage={binding.IsStorage}{target}/{probe}{writer}";
             }));
+        var buffers = string.Join(
+            ',',
+            draw.GlobalMemoryBindings.Select((binding, index) =>
+                $"{index}:0x{binding.BaseAddress:X16}:{binding.Data.Length}:" +
+                Convert.ToHexString(binding.Data.AsSpan(0, Math.Min(binding.Data.Length, 32)))));
+        var indices = draw.IndexBuffer is { } indexBuffer
+            ? $"{(indexBuffer.Is32Bit ? 32 : 16)}:" +
+              Convert.ToHexString(indexBuffer.Data.AsSpan(0, Math.Min(indexBuffer.Data.Length, 32)))
+            : "none";
         TraceAgcShader(
             $"agc.shader_draw es=0x{draw.ExportShaderAddress:X16} " +
             $"ps=0x{draw.PixelShaderAddress:X16} spirv={draw.PixelSpirv.Length} " +
             $"primitive=0x{draw.PrimitiveType:X} " +
             $"ps_ena=0x{psInputEna:X8} ps_addr=0x{psInputAddr:X8} " +
-            $"targets=[{targets}] textures=[{textures}]");
+            $"targets=[{targets}] textures=[{textures}] " +
+            $"buffers=[{buffers}] indices=[{indices}]");
     }
 
     private static IReadOnlyList<VulkanGuestDrawTexture> CreateVulkanGuestDrawTextures(
@@ -3511,6 +3541,12 @@ public static class AgcExports
                     out computeError))
             {
                 computeSpirv = compiledCompute.Spirv;
+                DumpSpirv(
+                    "cs",
+                    shaderAddress,
+                    shaderKey.Item2,
+                    computeSpirv,
+                    shaderState.Program);
             }
 
             if (computeSpirv is not null)
@@ -3527,6 +3563,7 @@ public static class AgcExports
                 var globalMemoryBuffers =
                     CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
                 VulkanVideoPresenter.SubmitComputeDispatch(
+                    shaderAddress,
                     computeSpirv,
                     textures,
                     globalMemoryBuffers,
@@ -3600,6 +3637,62 @@ public static class AgcExports
 
     private static string DescribeRegister(uint? register) =>
         register.HasValue ? $"s{register.Value}" : "-";
+
+    private static uint SelectExportUserDataRegister(
+        IReadOnlyDictionary<uint, uint> registers)
+    {
+        if (HasUserDataRange(registers, GsUserDataRegister))
+        {
+            return GsUserDataRegister;
+        }
+
+        if (HasUserDataRange(registers, EsUserDataRegister))
+        {
+            return EsUserDataRegister;
+        }
+
+        if (HasUserDataRange(registers, VsUserDataRegister))
+        {
+            return VsUserDataRegister;
+        }
+
+        var esValues = CountUserDataValues(registers, EsUserDataRegister);
+        var vsValues = CountUserDataValues(registers, VsUserDataRegister);
+        return esValues == 0 && vsValues != 0
+            ? VsUserDataRegister
+            : EsUserDataRegister;
+    }
+
+    private static bool HasUserDataRange(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint startRegister)
+    {
+        for (var index = 0u; index < 16; index++)
+        {
+            if (registers.ContainsKey(startRegister + index))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int CountUserDataValues(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint startRegister)
+    {
+        var count = 0;
+        for (var index = 0u; index < 16; index++)
+        {
+            count += registers.TryGetValue(startRegister + index, out var value) &&
+                     value != 0
+                ? 1
+                : 0;
+        }
+
+        return count;
+    }
 
     private static uint GetComputeLocalSize(
         IReadOnlyDictionary<uint, uint> registers,
@@ -3798,7 +3891,31 @@ public static class AgcExports
             }
         }
 
-        return $"probe={reads}/{sampleCount}:{nonzero}:0x{hash:X16}";
+        var bytesPerTexel = GetTextureBytesPerTexel(texture.Format);
+        var texels = bytesPerTexel is > 0 and <= 16
+            ? string.Join(
+                '/',
+                ProbeTextureTexel(ctx, texture.Address, (int)bytesPerTexel),
+                ProbeTextureTexel(
+                    ctx,
+                    texture.Address +
+                    (((ulong)(texture.Height / 2) * texture.Width) + (texture.Width / 2)) *
+                    bytesPerTexel,
+                    (int)bytesPerTexel),
+                ProbeTextureTexel(
+                    ctx,
+                    texture.Address + totalBytes - bytesPerTexel,
+                    (int)bytesPerTexel))
+            : "unsupported";
+        return $"probe={reads}/{sampleCount}:{nonzero}:0x{hash:X16}:texels={texels}";
+    }
+
+    private static string ProbeTextureTexel(CpuContext ctx, ulong address, int size)
+    {
+        var texel = new byte[size];
+        return ctx.Memory.TryRead(address, texel)
+            ? Convert.ToHexString(texel)
+            : "unreadable";
     }
 
     private static ulong GetTextureBytesPerTexel(uint format) =>
@@ -3912,9 +4029,10 @@ public static class AgcExports
                         exportShaderAddress,
                         exportShaderHeader,
                         state.ShRegisters,
-                        EsUserDataRegister,
+                        SelectExportUserDataRegister(state.ShRegisters),
                         out var exportState,
-                        out _) &&
+                        out _,
+                        userDataScalarRegisterBase: NggUserDataScalarRegisterBase) &&
                     Gen5ShaderTranslator.TryCreateState(
                         ctx,
                         pixelShaderAddress,
@@ -4881,6 +4999,46 @@ public static class AgcExports
         values.Count == 0
             ? "none"
             : string.Join(',', values.Select(static value => $"{value:X8}"));
+
+    private static void DumpSpirv(
+        string stage,
+        ulong shaderAddress,
+        ulong stateFingerprint,
+        byte[] spirv,
+        Gen5ShaderProgram program)
+    {
+        if (spirv.Length == 0 ||
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var directory = Path.Combine(AppContext.BaseDirectory, "shader-dumps");
+        Directory.CreateDirectory(directory);
+        var name = $"{shaderAddress:X16}-{stateFingerprint:X16}.{stage}";
+        File.WriteAllBytes(Path.Combine(directory, $"{name}.spv"), spirv);
+
+        var lines = new List<string>(program.Instructions.Count + 2)
+        {
+            $"address=0x{program.Address:X16}",
+            "pc words opcode destinations <- sources control",
+        };
+        foreach (var instruction in program.Instructions)
+        {
+            lines.Add(
+                $"0x{instruction.Pc:X4} " +
+                $"{string.Join('_', instruction.Words.Select(static word => $"{word:X8}"))} " +
+                $"{instruction.Opcode} " +
+                $"{string.Join(',', instruction.Destinations)} <- " +
+                $"{string.Join(',', instruction.Sources)} " +
+                $"{instruction.Control}");
+        }
+
+        File.WriteAllLines(Path.Combine(directory, $"{name}.ir.txt"), lines);
+    }
 
     private static void TraceCreateShader(ulong destinationAddress, ulong headerAddress, ulong codeAddress, string detail)
     {
