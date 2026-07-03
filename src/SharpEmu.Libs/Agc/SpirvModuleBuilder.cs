@@ -62,6 +62,7 @@ internal enum SpirvOp : ushort
     ImageDrefGather = 97,
     ImageRead = 98,
     ImageWrite = 99,
+    Image = 100,
     ImageQuerySizeLod = 103,
     ImageQuerySize = 104,
     ImageQueryLod = 105,
@@ -173,6 +174,8 @@ internal enum SpirvCapability : uint
     Float64 = 10,
     Int64 = 11,
     Int16 = 22,
+    ImageGatherExtended = 25,
+    StorageImageExtendedFormats = 49,
     ImageQuery = 50,
     StorageImageReadWithoutFormat = 55,
     StorageImageWriteWithoutFormat = 56,
@@ -310,6 +313,18 @@ internal sealed class SpirvModuleBuilder
     private readonly Dictionary<(uint Width, bool Signed), uint> _integerTypes = [];
     private readonly Dictionary<uint, uint> _floatTypes = [];
     private readonly Dictionary<(uint Component, uint Count), uint> _vectorTypes = [];
+    private readonly Dictionary<
+        (
+            uint SampledType,
+            SpirvImageDim Dimension,
+            bool Depth,
+            bool Arrayed,
+            bool Multisampled,
+            uint Sampled,
+            SpirvImageFormat Format
+        ),
+        uint> _imageTypes = [];
+    private readonly Dictionary<uint, uint> _sampledImageTypes = [];
     private readonly Dictionary<(SpirvStorageClass Storage, uint Type), uint> _pointerTypes = [];
     private readonly Dictionary<(uint Element, uint Count), uint> _arrayTypes = [];
     private readonly Dictionary<uint, uint> _runtimeArrayTypes = [];
@@ -478,6 +493,19 @@ internal sealed class SpirvModuleBuilder
         uint sampled,
         SpirvImageFormat format)
     {
+        var key = (
+            sampledType,
+            dimension,
+            depth,
+            arrayed,
+            multisampled,
+            sampled,
+            format);
+        if (_imageTypes.TryGetValue(key, out var existing))
+        {
+            return existing;
+        }
+
         var id = AllocateId();
         Emit(
             _typesConstantsGlobals,
@@ -490,13 +518,20 @@ internal sealed class SpirvModuleBuilder
             multisampled ? 1u : 0u,
             sampled,
             (uint)format);
+        _imageTypes.Add(key, id);
         return id;
     }
 
     public uint TypeSampledImage(uint imageType)
     {
+        if (_sampledImageTypes.TryGetValue(imageType, out var existing))
+        {
+            return existing;
+        }
+
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.TypeSampledImage, id, imageType);
+        _sampledImageTypes.Add(imageType, id);
         return id;
     }
 

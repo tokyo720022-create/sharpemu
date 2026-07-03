@@ -31,15 +31,81 @@ internal sealed record VulkanGuestDrawTexture(
     bool IsFallback,
     bool IsStorage,
     uint MipLevels = 1,
-    uint MipLevel = 0);
+    uint MipLevel = 0,
+    uint Pitch = 0,
+    uint TileMode = 0,
+    uint DstSelect = 0xFAC,
+    VulkanGuestSampler Sampler = default);
+
+internal readonly record struct VulkanGuestSampler(
+    uint Word0,
+    uint Word1,
+    uint Word2,
+    uint Word3);
 
 internal sealed record VulkanGuestMemoryBuffer(
     ulong BaseAddress,
     byte[] Data);
 
+internal sealed record VulkanGuestVertexBuffer(
+    uint Location,
+    uint ComponentCount,
+    ulong BaseAddress,
+    uint Stride,
+    uint OffsetBytes,
+    byte[] Data);
+
 internal sealed record VulkanGuestIndexBuffer(
     byte[] Data,
     bool Is32Bit);
+
+internal readonly record struct VulkanGuestRect(
+    int X,
+    int Y,
+    uint Width,
+    uint Height);
+
+internal readonly record struct VulkanGuestViewport(
+    float X,
+    float Y,
+    float Width,
+    float Height,
+    float MinDepth,
+    float MaxDepth);
+
+internal readonly record struct VulkanGuestBlendState(
+    bool Enable,
+    uint ColorSrcFactor,
+    uint ColorDstFactor,
+    uint ColorFunc,
+    uint AlphaSrcFactor,
+    uint AlphaDstFactor,
+    uint AlphaFunc,
+    bool SeparateAlphaBlend,
+    uint WriteMask)
+{
+    public static VulkanGuestBlendState Default { get; } = new(
+        Enable: false,
+        ColorSrcFactor: 1,
+        ColorDstFactor: 0,
+        ColorFunc: 0,
+        AlphaSrcFactor: 1,
+        AlphaDstFactor: 0,
+        AlphaFunc: 0,
+        SeparateAlphaBlend: false,
+        WriteMask: 0xFu);
+}
+
+internal sealed record VulkanGuestRenderState(
+    VulkanGuestBlendState Blend,
+    VulkanGuestRect? Scissor,
+    VulkanGuestViewport? Viewport)
+{
+    public static VulkanGuestRenderState Default { get; } = new(
+        VulkanGuestBlendState.Default,
+        Scissor: null,
+        Viewport: null);
+}
 
 internal sealed record VulkanGuestRenderTarget(
     ulong Address,
@@ -54,11 +120,13 @@ internal sealed record VulkanTranslatedGuestDraw(
     byte[] PixelSpirv,
     IReadOnlyList<VulkanGuestDrawTexture> Textures,
     IReadOnlyList<VulkanGuestMemoryBuffer> GlobalMemoryBuffers,
+    IReadOnlyList<VulkanGuestVertexBuffer> VertexBuffers,
     uint AttributeCount,
     uint VertexCount,
     uint InstanceCount,
     uint PrimitiveType,
-    VulkanGuestIndexBuffer? IndexBuffer);
+    VulkanGuestIndexBuffer? IndexBuffer,
+    VulkanGuestRenderState RenderState);
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
@@ -76,8 +144,11 @@ internal sealed record VulkanComputeGuestDispatch(
 
 internal static unsafe class VulkanVideoPresenter
 {
+    private const uint DefaultWindowWidth = 1280;
+    private const uint DefaultWindowHeight = 720;
     private const int MaxPendingGuestWork = 16;
     private const int MaxGuestWorkPerRender = 16;
+    private const uint GuestPrimitiveRectList = 0x11;
     private const uint GuestFormatR32Uint = 0x10004;
     private const uint GuestFormatR32Sint = 0x20004;
     private const uint GuestFormatR32Sfloat = 0x30004;
@@ -288,7 +359,9 @@ internal static unsafe class VulkanVideoPresenter
         uint vertexCount = 3,
         uint instanceCount = 1,
         uint primitiveType = 4,
-        VulkanGuestIndexBuffer? indexBuffer = null)
+        VulkanGuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
+        VulkanGuestRenderState? renderState = null)
     {
         if (pixelSpirv.Length == 0 || width == 0 || height == 0)
         {
@@ -314,11 +387,13 @@ internal static unsafe class VulkanVideoPresenter
                     pixelSpirv,
                     textures.ToArray(),
                     globalMemoryBuffers.ToArray(),
+                    vertexBuffers?.ToArray() ?? [],
                     attributeCount,
                     vertexCount,
                     instanceCount,
                     primitiveType,
-                    indexBuffer),
+                    indexBuffer,
+                    renderState ?? VulkanGuestRenderState.Default),
                 RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false);
             if (_thread is not null)
@@ -347,7 +422,9 @@ internal static unsafe class VulkanVideoPresenter
         uint vertexCount = 3,
         uint instanceCount = 1,
         uint primitiveType = 4,
-        VulkanGuestIndexBuffer? indexBuffer = null)
+        VulkanGuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
+        VulkanGuestRenderState? renderState = null)
     {
         if (pixelSpirv.Length == 0 ||
             target.Address == 0 ||
@@ -379,11 +456,13 @@ internal static unsafe class VulkanVideoPresenter
                         pixelSpirv,
                         textures.ToArray(),
                         globalMemoryBuffers.ToArray(),
+                        vertexBuffers?.ToArray() ?? [],
                         attributeCount,
                         vertexCount,
                         instanceCount,
                         primitiveType,
-                        indexBuffer),
+                        indexBuffer,
+                        renderState ?? VulkanGuestRenderState.Default),
                     target,
                     PublishTarget: true));
         }
@@ -419,11 +498,13 @@ internal static unsafe class VulkanVideoPresenter
                         pixelSpirv,
                         textures.ToArray(),
                         globalMemoryBuffers.ToArray(),
+                        [],
                         attributeCount,
                         3,
                         1,
                         4,
-                        null),
+                        null,
+                        VulkanGuestRenderState.Default),
                     new VulkanGuestRenderTarget(
                         Address: 0,
                         width,
@@ -779,6 +860,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureUploads = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
+        private int _tracedVertexBufferCount;
         private readonly Dictionary<byte[], Pipeline> _computePipelines =
             new(ReferenceEqualityComparer.Instance);
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
@@ -792,15 +874,18 @@ internal static unsafe class VulkanVideoPresenter
             public DescriptorSetLayout DescriptorSetLayout;
             public DescriptorPool DescriptorPool;
             public DescriptorSet DescriptorSet;
-            public Sampler Sampler;
             public TextureResource[] Textures = [];
             public GlobalBufferResource[] GlobalMemoryBuffers = [];
+            public VertexBufferResource[] VertexBuffers = [];
             public VkBuffer IndexBuffer;
             public DeviceMemory IndexMemory;
             public bool Index32Bit;
             public uint VertexCount = 3;
             public uint InstanceCount = 1;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
+            public VulkanGuestBlendState Blend = VulkanGuestBlendState.Default;
+            public VulkanGuestRect? Scissor;
+            public VulkanGuestViewport? Viewport;
         }
 
         private sealed class TextureResource
@@ -813,9 +898,13 @@ internal static unsafe class VulkanVideoPresenter
             public ImageView View;
             public uint Width;
             public uint Height;
+            public uint RowLength;
+            public uint DstSelect;
             public bool NeedsUpload;
             public bool OwnsStorage;
             public bool IsStorage;
+            public VulkanGuestSampler SamplerState;
+            public Sampler Sampler;
             public GuestImageResource? GuestImage;
         }
 
@@ -824,6 +913,17 @@ internal static unsafe class VulkanVideoPresenter
             public VkBuffer Buffer;
             public DeviceMemory Memory;
             public ulong Size;
+        }
+
+        private sealed class VertexBufferResource
+        {
+            public VkBuffer Buffer;
+            public DeviceMemory Memory;
+            public ulong Size;
+            public uint Location;
+            public uint ComponentCount;
+            public uint Stride;
+            public uint OffsetBytes;
         }
 
         private sealed class GuestImageResource
@@ -837,7 +937,7 @@ internal static unsafe class VulkanVideoPresenter
             public DeviceMemory Memory;
             public ImageView View;
             public ImageView[] MipViews = [];
-            public Dictionary<(Format Format, uint MipLevel, uint LevelCount), ImageView> FormatViews { get; } = new();
+            public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
             public RenderPass RenderPass;
             public Framebuffer Framebuffer;
             public bool Initialized;
@@ -854,7 +954,7 @@ internal static unsafe class VulkanVideoPresenter
         public Presenter(uint width, uint height)
         {
             var options = WindowOptions.DefaultVulkan;
-            options.Size = new Vector2D<int>((int)width, (int)height);
+            options.Size = new Vector2D<int>((int)DefaultWindowWidth, (int)DefaultWindowHeight);
             options.Title = VideoOutExports.GetWindowTitle();
             options.WindowBorder = WindowBorder.Fixed;
             options.VSync = true;
@@ -1682,9 +1782,13 @@ internal static unsafe class VulkanVideoPresenter
                 Textures = new TextureResource[draw.Textures.Count],
                 GlobalMemoryBuffers =
                     new GlobalBufferResource[draw.GlobalMemoryBuffers.Count],
-                VertexCount = draw.VertexCount,
+                VertexBuffers = new VertexBufferResource[draw.VertexBuffers.Count],
+                VertexCount = GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
                 InstanceCount = Math.Max(draw.InstanceCount, 1),
                 Topology = GetPrimitiveTopology(draw.PrimitiveType),
+                Blend = draw.RenderState.Blend,
+                Scissor = draw.RenderState.Scissor,
+                Viewport = draw.RenderState.Viewport,
             };
 
             try
@@ -1706,6 +1810,12 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     resources.GlobalMemoryBuffers[index] =
                         CreateGlobalBufferResource(draw.GlobalMemoryBuffers[index]);
+                }
+
+                for (var index = 0; index < draw.VertexBuffers.Count; index++)
+                {
+                    resources.VertexBuffers[index] =
+                        CreateVertexBufferResource(draw.VertexBuffers[index]);
                 }
 
                 if (draw.IndexBuffer is { Data.Length: > 0 } indexBuffer)
@@ -1811,6 +1921,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     TraceVulkanShader(
                         $"vk.compute_resources pipeline begin " +
+                        $"cs=0x{dispatch.ShaderAddress:X16} " +
                         $"spirv={dispatch.ComputeSpirv.Length} " +
                         $"textures={resources.Textures.Length} " +
                         $"globals={resources.GlobalMemoryBuffers.Length}");
@@ -1934,26 +2045,6 @@ internal static unsafe class VulkanVideoPresenter
                 "vkCreatePipelineLayout");
             resources.PipelineLayout = translatedPipelineLayout;
 
-            if (sampledImageCount != 0)
-            {
-                var samplerInfo = new SamplerCreateInfo
-                {
-                    SType = StructureType.SamplerCreateInfo,
-                    MagFilter = Filter.Linear,
-                    MinFilter = Filter.Linear,
-                    MipmapMode = SamplerMipmapMode.Linear,
-                    AddressModeU = SamplerAddressMode.ClampToEdge,
-                    AddressModeV = SamplerAddressMode.ClampToEdge,
-                    AddressModeW = SamplerAddressMode.ClampToEdge,
-                    MaxLod = 16,
-                };
-                Sampler sampler;
-                Check(
-                    _vk.CreateSampler(_device, &samplerInfo, null, out sampler),
-                    "vkCreateSampler");
-                resources.Sampler = sampler;
-            }
-
             var poolSizes = new DescriptorPoolSize[
                 (sampledImageCount == 0 ? 0 : 1) +
                 (storageImageCount == 0 ? 0 : 1) +
@@ -2053,9 +2144,16 @@ internal static unsafe class VulkanVideoPresenter
                 for (var index = 0; index < textureCount; index++)
                 {
                     var isStorage = resources.Textures[index].IsStorage;
+                    if (!isStorage &&
+                        resources.Textures[index].Sampler.Handle == 0)
+                    {
+                        resources.Textures[index].Sampler =
+                            CreateSampler(resources.Textures[index].SamplerState);
+                    }
+
                     imageInfoPointer[index] = new DescriptorImageInfo
                     {
-                        Sampler = isStorage ? default : resources.Sampler,
+                        Sampler = isStorage ? default : resources.Textures[index].Sampler,
                         ImageView = resources.Textures[index].View,
                         ImageLayout = isStorage ||
                             resources.Textures[index].GuestImage is { } guestImage &&
@@ -2116,90 +2214,138 @@ internal static unsafe class VulkanVideoPresenter
                     PName = entryPoint,
                 };
 
-                var vertexInput = new PipelineVertexInputStateCreateInfo
+                var vertexBindingDescriptions =
+                    new VertexInputBindingDescription[resources.VertexBuffers.Length];
+                var vertexAttributeDescriptions =
+                    new VertexInputAttributeDescription[resources.VertexBuffers.Length];
+                for (var index = 0; index < resources.VertexBuffers.Length; index++)
                 {
-                    SType = StructureType.PipelineVertexInputStateCreateInfo,
-                };
-                var inputAssembly = new PipelineInputAssemblyStateCreateInfo
+                    var vertexBuffer = resources.VertexBuffers[index];
+                    vertexBindingDescriptions[index] = new VertexInputBindingDescription
+                    {
+                        Binding = (uint)index,
+                        Stride = vertexBuffer.Stride == 0
+                            ? Math.Max(vertexBuffer.ComponentCount, 1) * sizeof(float)
+                            : vertexBuffer.Stride,
+                        InputRate = VertexInputRate.Vertex,
+                    };
+                    vertexAttributeDescriptions[index] = new VertexInputAttributeDescription
+                    {
+                        Location = vertexBuffer.Location,
+                        Binding = (uint)index,
+                        Format = ToVkVertexFormat(vertexBuffer.ComponentCount),
+                        Offset = 0,
+                    };
+                }
+
+                fixed (VertexInputBindingDescription* vertexBindingPointerBase = vertexBindingDescriptions)
+                fixed (VertexInputAttributeDescription* vertexAttributePointerBase = vertexAttributeDescriptions)
                 {
-                    SType = StructureType.PipelineInputAssemblyStateCreateInfo,
-                    Topology = resources.Topology,
-                };
-                var viewport = new Viewport(0, 0, extent.Width, extent.Height, 0, 1);
-                var scissor = new Rect2D(new Offset2D(0, 0), extent);
-                var viewportState = new PipelineViewportStateCreateInfo
-                {
-                    SType = StructureType.PipelineViewportStateCreateInfo,
-                    ViewportCount = 1,
-                    PViewports = &viewport,
-                    ScissorCount = 1,
-                    PScissors = &scissor,
-                };
-                var rasterization = new PipelineRasterizationStateCreateInfo
-                {
-                    SType = StructureType.PipelineRasterizationStateCreateInfo,
-                    PolygonMode = PolygonMode.Fill,
-                    CullMode = CullModeFlags.None,
-                    FrontFace = FrontFace.CounterClockwise,
-                    LineWidth = 1,
-                };
-                var multisample = new PipelineMultisampleStateCreateInfo
-                {
-                    SType = StructureType.PipelineMultisampleStateCreateInfo,
-                    RasterizationSamples = SampleCountFlags.Count1Bit,
-                };
-                var colorBlendAttachment = new PipelineColorBlendAttachmentState
-                {
-                    ColorWriteMask =
-                        ColorComponentFlags.RBit |
-                        ColorComponentFlags.GBit |
-                        ColorComponentFlags.BBit |
-                        ColorComponentFlags.ABit,
-                };
-                var colorBlend = new PipelineColorBlendStateCreateInfo
-                {
-                    SType = StructureType.PipelineColorBlendStateCreateInfo,
-                    AttachmentCount = 1,
-                    PAttachments = &colorBlendAttachment,
-                };
-                var dynamicStateValue = DynamicState.Scissor;
-                var dynamicState = new PipelineDynamicStateCreateInfo
-                {
-                    SType = StructureType.PipelineDynamicStateCreateInfo,
-                    DynamicStateCount = 1,
-                    PDynamicStates = &dynamicStateValue,
-                };
-                var pipelineInfo = new GraphicsPipelineCreateInfo
-                {
-                    SType = StructureType.GraphicsPipelineCreateInfo,
-                    StageCount = 2,
-                    PStages = shaderStages,
-                    PVertexInputState = &vertexInput,
-                    PInputAssemblyState = &inputAssembly,
-                    PViewportState = &viewportState,
-                    PRasterizationState = &rasterization,
-                    PMultisampleState = &multisample,
-                    PColorBlendState = &colorBlend,
-                    PDynamicState = &dynamicState,
-                    Layout = resources.PipelineLayout,
-                    RenderPass = renderPass,
-                    Subpass = 0,
-                };
-                Pipeline pipeline;
-                Check(
-                    _vk.CreateGraphicsPipelines(
-                        _device,
-                        default,
-                        1,
-                        &pipelineInfo,
-                        null,
-                        out pipeline),
-                    "vkCreateGraphicsPipelines(translated)");
-                resources.Pipeline = pipeline;
-                SetDebugName(
-                    ObjectType.Pipeline,
-                    pipeline.Handle,
-                    $"SharpEmu graphics ps={fragmentSpirv.Length}b attrs={resources.Textures.Length}");
+                    var vertexInput = new PipelineVertexInputStateCreateInfo
+                    {
+                        SType = StructureType.PipelineVertexInputStateCreateInfo,
+                        VertexBindingDescriptionCount = (uint)vertexBindingDescriptions.Length,
+                        PVertexBindingDescriptions = vertexBindingDescriptions.Length == 0
+                            ? null
+                            : vertexBindingPointerBase,
+                        VertexAttributeDescriptionCount = (uint)vertexAttributeDescriptions.Length,
+                        PVertexAttributeDescriptions = vertexAttributeDescriptions.Length == 0
+                            ? null
+                            : vertexAttributePointerBase,
+                    };
+                    var inputAssembly = new PipelineInputAssemblyStateCreateInfo
+                    {
+                        SType = StructureType.PipelineInputAssemblyStateCreateInfo,
+                        Topology = resources.Topology,
+                    };
+                    var viewport = new Viewport(0, 0, extent.Width, extent.Height, 0, 1);
+                    var scissor = new Rect2D(new Offset2D(0, 0), extent);
+                    var viewportState = new PipelineViewportStateCreateInfo
+                    {
+                        SType = StructureType.PipelineViewportStateCreateInfo,
+                        ViewportCount = 1,
+                        PViewports = &viewport,
+                        ScissorCount = 1,
+                        PScissors = &scissor,
+                    };
+                    var rasterization = new PipelineRasterizationStateCreateInfo
+                    {
+                        SType = StructureType.PipelineRasterizationStateCreateInfo,
+                        PolygonMode = PolygonMode.Fill,
+                        CullMode = CullModeFlags.None,
+                        FrontFace = FrontFace.CounterClockwise,
+                        LineWidth = 1,
+                    };
+                    var multisample = new PipelineMultisampleStateCreateInfo
+                    {
+                        SType = StructureType.PipelineMultisampleStateCreateInfo,
+                        RasterizationSamples = SampleCountFlags.Count1Bit,
+                    };
+                    var colorBlendAttachment = new PipelineColorBlendAttachmentState
+                    {
+                        BlendEnable = resources.Blend.Enable,
+                        SrcColorBlendFactor = ToVkBlendFactor(resources.Blend.ColorSrcFactor),
+                        DstColorBlendFactor = ToVkBlendFactor(resources.Blend.ColorDstFactor),
+                        ColorBlendOp = ToVkBlendOp(resources.Blend.ColorFunc),
+                        SrcAlphaBlendFactor = resources.Blend.SeparateAlphaBlend
+                            ? ToVkBlendFactor(resources.Blend.AlphaSrcFactor)
+                            : ToVkBlendFactor(resources.Blend.ColorSrcFactor),
+                        DstAlphaBlendFactor = resources.Blend.SeparateAlphaBlend
+                            ? ToVkBlendFactor(resources.Blend.AlphaDstFactor)
+                            : ToVkBlendFactor(resources.Blend.ColorDstFactor),
+                        AlphaBlendOp = resources.Blend.SeparateAlphaBlend
+                            ? ToVkBlendOp(resources.Blend.AlphaFunc)
+                            : ToVkBlendOp(resources.Blend.ColorFunc),
+                        ColorWriteMask =
+                            ToVkColorWriteMask(resources.Blend.WriteMask),
+                    };
+                    var colorBlend = new PipelineColorBlendStateCreateInfo
+                    {
+                        SType = StructureType.PipelineColorBlendStateCreateInfo,
+                        AttachmentCount = 1,
+                        PAttachments = &colorBlendAttachment,
+                    };
+                    var dynamicStateValues = stackalloc DynamicState[2];
+                    dynamicStateValues[0] = DynamicState.Viewport;
+                    dynamicStateValues[1] = DynamicState.Scissor;
+                    var dynamicState = new PipelineDynamicStateCreateInfo
+                    {
+                        SType = StructureType.PipelineDynamicStateCreateInfo,
+                        DynamicStateCount = 2,
+                        PDynamicStates = dynamicStateValues,
+                    };
+                    var pipelineInfo = new GraphicsPipelineCreateInfo
+                    {
+                        SType = StructureType.GraphicsPipelineCreateInfo,
+                        StageCount = 2,
+                        PStages = shaderStages,
+                        PVertexInputState = &vertexInput,
+                        PInputAssemblyState = &inputAssembly,
+                        PViewportState = &viewportState,
+                        PRasterizationState = &rasterization,
+                        PMultisampleState = &multisample,
+                        PColorBlendState = &colorBlend,
+                        PDynamicState = &dynamicState,
+                        Layout = resources.PipelineLayout,
+                        RenderPass = renderPass,
+                        Subpass = 0,
+                    };
+                    Pipeline pipeline;
+                    Check(
+                        _vk.CreateGraphicsPipelines(
+                            _device,
+                            default,
+                            1,
+                            &pipelineInfo,
+                            null,
+                            out pipeline),
+                        "vkCreateGraphicsPipelines(translated)");
+                    resources.Pipeline = pipeline;
+                    SetDebugName(
+                        ObjectType.Pipeline,
+                        pipeline.Handle,
+                        $"SharpEmu graphics ps={fragmentSpirv.Length}b attrs={resources.Textures.Length}");
+                }
             }
             finally
             {
@@ -2282,6 +2428,7 @@ internal static unsafe class VulkanVideoPresenter
                     vkFormat,
                     mipLevel: 0,
                     levelCount: guestImage.MipLevels,
+                    dstSelect: texture.DstSelect,
                     out var view))
             {
                 if (_tracedTextureCacheHits.Add(
@@ -2300,6 +2447,9 @@ internal static unsafe class VulkanVideoPresenter
                     View = view,
                     Width = guestImage.Width,
                     Height = guestImage.Height,
+                    RowLength = guestImage.Width,
+                    DstSelect = texture.DstSelect,
+                    SamplerState = texture.Sampler,
                     GuestImage = guestImage,
                 };
             }
@@ -2329,7 +2479,10 @@ internal static unsafe class VulkanVideoPresenter
                 View = view,
                 Width = guestImage.Width,
                 Height = guestImage.Height,
+                RowLength = guestImage.Width,
+                DstSelect = texture.DstSelect,
                 IsStorage = true,
+                SamplerState = texture.Sampler,
                 GuestImage = guestImage,
             };
 
@@ -2463,8 +2616,11 @@ internal static unsafe class VulkanVideoPresenter
                 View = view,
                 Width = width,
                 Height = height,
+                RowLength = width,
+                DstSelect = texture.DstSelect,
                 OwnsStorage = true,
                 IsStorage = true,
+                SamplerState = texture.Sampler,
                 GuestImage = guestImage,
             };
         }
@@ -2499,19 +2655,24 @@ internal static unsafe class VulkanVideoPresenter
         {
             var width = Math.Max(texture.Width, 1);
             var height = Math.Max(texture.Height, 1);
+            var rowLength = texture.TileMode == 0
+                ? Math.Max(texture.Pitch, width)
+                : width;
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
 
-            var expectedSize = GetTextureByteCount(texture.Format, width, height);
+            var expectedSize = GetTextureByteCount(texture.Format, rowLength, height);
             if (_tracedTextureUploads.Add((texture.Address, width, height, vkFormat)))
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.texture addr=0x{texture.Address:X16} " +
                     $"fmt={texture.Format} num={texture.NumberType} vk={vkFormat} " +
-                    $"size={width}x{height} bytes={texture.RgbaPixels.Length} expected={expectedSize}");
+                    $"size={width}x{height} row={rowLength} tile={texture.TileMode} " +
+                    $"dst=0x{texture.DstSelect:X3} " +
+                    $"bytes={texture.RgbaPixels.Length} expected={expectedSize}");
             }
             var pixels = texture.RgbaPixels.Length == (int)expectedSize
                 ? texture.RgbaPixels
-                : CreateFallbackTexturePixels(texture.Format, width, height, expectedSize);
+                : CreateFallbackTexturePixels(texture.Format, rowLength, height, expectedSize);
             var uploadPixels = texture.Format == 13
                 ? ExpandRgb32Pixels(pixels)
                 : pixels;
@@ -2567,11 +2728,7 @@ internal static unsafe class VulkanVideoPresenter
                 Image = image,
                 ViewType = ImageViewType.Type2D,
                 Format = vkFormat,
-                Components = new ComponentMapping(
-                    ComponentSwizzle.Identity,
-                    ComponentSwizzle.Identity,
-                    ComponentSwizzle.Identity,
-                    ComponentSwizzle.Identity),
+                Components = ToVkComponentMapping(texture.DstSelect),
                 SubresourceRange = ColorSubresourceRange(),
             };
             Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(texture)");
@@ -2589,10 +2746,70 @@ internal static unsafe class VulkanVideoPresenter
                 View = view,
                 Width = width,
                 Height = height,
+                RowLength = rowLength,
+                DstSelect = texture.DstSelect,
                 NeedsUpload = true,
                 OwnsStorage = true,
+                SamplerState = texture.Sampler,
             };
         }
+
+        private Sampler CreateSampler(VulkanGuestSampler sampler)
+        {
+            var minLod = DecodeSamplerMipFilter(sampler) == 0
+                ? 0f
+                : DecodeSamplerMinLod(sampler);
+            var maxLod = DecodeSamplerMipFilter(sampler) == 0
+                ? 0f
+                : DecodeSamplerMaxLod(sampler);
+            var samplerInfo = new SamplerCreateInfo
+            {
+                SType = StructureType.SamplerCreateInfo,
+                MagFilter = ToVkFilter(DecodeSamplerMagFilter(sampler)),
+                MinFilter = ToVkFilter(DecodeSamplerMinFilter(sampler)),
+                MipmapMode = ToVkMipFilter(DecodeSamplerMipFilter(sampler)),
+                AddressModeU = ToVkSamplerAddressMode(DecodeSamplerClampX(sampler)),
+                AddressModeV = ToVkSamplerAddressMode(DecodeSamplerClampY(sampler)),
+                AddressModeW = ToVkSamplerAddressMode(DecodeSamplerClampZ(sampler)),
+                MipLodBias = DecodeSamplerLodBias(sampler),
+                CompareEnable = DecodeSamplerDepthCompare(sampler) != 0,
+                CompareOp = ToVkCompareOp(DecodeSamplerDepthCompare(sampler)),
+                MinLod = minLod,
+                MaxLod = Math.Max(minLod, maxLod),
+                BorderColor = ToVkBorderColor(DecodeSamplerBorderColor(sampler)),
+            };
+            Sampler vkSampler;
+            Check(
+                _vk.CreateSampler(_device, &samplerInfo, null, out vkSampler),
+                "vkCreateSampler(texture)");
+            return vkSampler;
+        }
+
+        private static ComponentMapping ToVkComponentMapping(uint dstSelect)
+        {
+            if (dstSelect == 0)
+            {
+                dstSelect = 0xFAC;
+            }
+
+            return new ComponentMapping(
+                ToVkComponentSwizzle(dstSelect & 0x7),
+                ToVkComponentSwizzle((dstSelect >> 3) & 0x7),
+                ToVkComponentSwizzle((dstSelect >> 6) & 0x7),
+                ToVkComponentSwizzle((dstSelect >> 9) & 0x7));
+        }
+
+        private static ComponentSwizzle ToVkComponentSwizzle(uint selector) =>
+            selector switch
+            {
+                0 => ComponentSwizzle.Zero,
+                1 => ComponentSwizzle.One,
+                4 => ComponentSwizzle.R,
+                5 => ComponentSwizzle.G,
+                6 => ComponentSwizzle.B,
+                7 => ComponentSwizzle.A,
+                _ => ComponentSwizzle.Identity,
+            };
 
         private static byte[] ExpandRgb32Pixels(byte[] pixels)
         {
@@ -2636,6 +2853,40 @@ internal static unsafe class VulkanVideoPresenter
             };
         }
 
+        private VertexBufferResource CreateVertexBufferResource(
+            VulkanGuestVertexBuffer guestBuffer)
+        {
+            var buffer = CreateHostBuffer(
+                guestBuffer.Data,
+                BufferUsageFlags.VertexBufferBit,
+                out var memory);
+            var size = (ulong)Math.Max(guestBuffer.Data.Length, sizeof(uint));
+            SetDebugName(
+                ObjectType.Buffer,
+                buffer.Handle,
+                $"SharpEmu vertex loc{guestBuffer.Location} " +
+                $"0x{guestBuffer.BaseAddress:X16} {guestBuffer.Data.Length}b");
+            if (_tracedVertexBufferCount++ < 64)
+            {
+                TraceVulkanShader(
+                    $"vk.vertex_buffer loc={guestBuffer.Location} " +
+                    $"base=0x{guestBuffer.BaseAddress:X16} stride={guestBuffer.Stride} " +
+                    $"offset={guestBuffer.OffsetBytes} comps={guestBuffer.ComponentCount} " +
+                    $"bytes={guestBuffer.Data.Length}");
+            }
+
+            return new VertexBufferResource
+            {
+                Buffer = buffer,
+                Memory = memory,
+                Size = size,
+                Location = guestBuffer.Location,
+                ComponentCount = guestBuffer.ComponentCount,
+                Stride = guestBuffer.Stride,
+                OffsetBytes = guestBuffer.OffsetBytes,
+            };
+        }
+
         private VkBuffer CreateHostBuffer(
             ReadOnlySpan<byte> data,
             BufferUsageFlags usage,
@@ -2676,8 +2927,230 @@ internal static unsafe class VulkanVideoPresenter
                 3 => PrimitiveTopology.LineStrip,
                 5 => PrimitiveTopology.TriangleFan,
                 6 => PrimitiveTopology.TriangleStrip,
+                GuestPrimitiveRectList => PrimitiveTopology.TriangleStrip,
                 _ => PrimitiveTopology.TriangleList,
             };
+
+        private static Format ToVkVertexFormat(uint componentCount) =>
+            componentCount switch
+            {
+                1 => Format.R32Sfloat,
+                2 => Format.R32G32Sfloat,
+                3 => Format.R32G32B32Sfloat,
+                4 => Format.R32G32B32A32Sfloat,
+                _ => Format.R32Sfloat,
+            };
+
+        private static ulong GetVertexBindingOffset(VertexBufferResource vertexBuffer)
+        {
+            if (vertexBuffer.OffsetBytes < vertexBuffer.Size)
+            {
+                return vertexBuffer.OffsetBytes;
+            }
+
+            TraceVulkanShader(
+                $"vk.vertex_offset_oob loc={vertexBuffer.Location} " +
+                $"offset={vertexBuffer.OffsetBytes} size={vertexBuffer.Size}");
+            return 0;
+        }
+
+        private static uint GetDrawVertexCount(
+            uint primitiveType,
+            uint vertexCount,
+            VulkanGuestIndexBuffer? indexBuffer)
+        {
+            if (primitiveType == GuestPrimitiveRectList && indexBuffer is null)
+            {
+                return 4;
+            }
+
+            return vertexCount;
+        }
+
+        private static BlendFactor ToVkBlendFactor(uint factor) =>
+            factor switch
+            {
+                0 => BlendFactor.Zero,
+                1 => BlendFactor.One,
+                2 => BlendFactor.SrcColor,
+                3 => BlendFactor.OneMinusSrcColor,
+                4 => BlendFactor.SrcAlpha,
+                5 => BlendFactor.OneMinusSrcAlpha,
+                6 => BlendFactor.DstAlpha,
+                7 => BlendFactor.OneMinusDstAlpha,
+                8 => BlendFactor.DstColor,
+                9 => BlendFactor.OneMinusDstColor,
+                10 => BlendFactor.SrcAlphaSaturate,
+                13 => BlendFactor.ConstantColor,
+                14 => BlendFactor.OneMinusConstantColor,
+                15 => BlendFactor.Src1Color,
+                16 => BlendFactor.OneMinusSrc1Color,
+                17 => BlendFactor.Src1Alpha,
+                18 => BlendFactor.OneMinusSrc1Alpha,
+                19 => BlendFactor.ConstantAlpha,
+                20 => BlendFactor.OneMinusConstantAlpha,
+                _ => BlendFactor.One,
+            };
+
+        private static BlendOp ToVkBlendOp(uint function) =>
+            function switch
+            {
+                0 => BlendOp.Add,
+                1 => BlendOp.Subtract,
+                2 => BlendOp.Min,
+                3 => BlendOp.Max,
+                4 => BlendOp.ReverseSubtract,
+                _ => BlendOp.Add,
+            };
+
+        private static uint DecodeSamplerClampX(VulkanGuestSampler sampler) =>
+            sampler.Word0 & 0x7u;
+
+        private static uint DecodeSamplerClampY(VulkanGuestSampler sampler) =>
+            (sampler.Word0 >> 3) & 0x7u;
+
+        private static uint DecodeSamplerClampZ(VulkanGuestSampler sampler) =>
+            (sampler.Word0 >> 6) & 0x7u;
+
+        private static uint DecodeSamplerDepthCompare(VulkanGuestSampler sampler) =>
+            (sampler.Word0 >> 12) & 0x7u;
+
+        private static float DecodeSamplerMinLod(VulkanGuestSampler sampler) =>
+            (sampler.Word1 & 0xFFFu) / 256.0f;
+
+        private static float DecodeSamplerMaxLod(VulkanGuestSampler sampler) =>
+            ((sampler.Word1 >> 12) & 0xFFFu) / 256.0f;
+
+        private static float DecodeSamplerLodBias(VulkanGuestSampler sampler)
+        {
+            var raw = sampler.Word2 & 0x3FFFu;
+            var signed = (short)((raw ^ 0x2000u) - 0x2000u);
+            return signed / 256.0f;
+        }
+
+        private static uint DecodeSamplerMagFilter(VulkanGuestSampler sampler) =>
+            (sampler.Word2 >> 20) & 0x3u;
+
+        private static uint DecodeSamplerMinFilter(VulkanGuestSampler sampler) =>
+            (sampler.Word2 >> 22) & 0x3u;
+
+        private static uint DecodeSamplerMipFilter(VulkanGuestSampler sampler) =>
+            (sampler.Word2 >> 26) & 0x3u;
+
+        private static uint DecodeSamplerBorderColor(VulkanGuestSampler sampler) =>
+            (sampler.Word3 >> 30) & 0x3u;
+
+        private static SamplerAddressMode ToVkSamplerAddressMode(uint mode) =>
+            mode switch
+            {
+                0 => SamplerAddressMode.Repeat,
+                1 => SamplerAddressMode.MirroredRepeat,
+                2 => SamplerAddressMode.ClampToEdge,
+                3 or 5 or 7 => SamplerAddressMode.MirrorClampToEdge,
+                4 or 6 => SamplerAddressMode.ClampToBorder,
+                _ => SamplerAddressMode.ClampToEdge,
+            };
+
+        private static Filter ToVkFilter(uint filter) =>
+            filter is 1 or 3 ? Filter.Linear : Filter.Nearest;
+
+        private static SamplerMipmapMode ToVkMipFilter(uint filter) =>
+            filter == 2 ? SamplerMipmapMode.Linear : SamplerMipmapMode.Nearest;
+
+        private static CompareOp ToVkCompareOp(uint compare) =>
+            compare switch
+            {
+                1 => CompareOp.Less,
+                2 => CompareOp.Equal,
+                3 => CompareOp.LessOrEqual,
+                4 => CompareOp.Greater,
+                5 => CompareOp.NotEqual,
+                6 => CompareOp.GreaterOrEqual,
+                7 => CompareOp.Always,
+                _ => CompareOp.Never,
+            };
+
+        private static BorderColor ToVkBorderColor(uint color) =>
+            color switch
+            {
+                1 => BorderColor.FloatTransparentBlack,
+                2 => BorderColor.FloatOpaqueWhite,
+                _ => BorderColor.FloatOpaqueBlack,
+            };
+
+        private static ColorComponentFlags ToVkColorWriteMask(uint mask)
+        {
+            var flags = default(ColorComponentFlags);
+            if ((mask & 1u) != 0)
+            {
+                flags |= ColorComponentFlags.RBit;
+            }
+
+            if ((mask & 2u) != 0)
+            {
+                flags |= ColorComponentFlags.GBit;
+            }
+
+            if ((mask & 4u) != 0)
+            {
+                flags |= ColorComponentFlags.BBit;
+            }
+
+            if ((mask & 8u) != 0)
+            {
+                flags |= ColorComponentFlags.ABit;
+            }
+
+            return flags;
+        }
+
+        private static VulkanGuestRect ClampScissor(VulkanGuestRect? scissor, Extent2D extent)
+        {
+            if (scissor is not { } rect)
+            {
+                return new VulkanGuestRect(0, 0, extent.Width, extent.Height);
+            }
+
+            var left = Math.Clamp(rect.X, 0, checked((int)extent.Width));
+            var top = Math.Clamp(rect.Y, 0, checked((int)extent.Height));
+            var right = Math.Clamp(
+                rect.X + checked((int)rect.Width),
+                left,
+                checked((int)extent.Width));
+            var bottom = Math.Clamp(
+                rect.Y + checked((int)rect.Height),
+                top,
+                checked((int)extent.Height));
+            return new VulkanGuestRect(
+                left,
+                top,
+                checked((uint)(right - left)),
+                checked((uint)(bottom - top)));
+        }
+
+        private static Viewport ClampViewport(VulkanGuestViewport? viewport, Extent2D extent)
+        {
+            if (viewport is not { } rect)
+            {
+                return new Viewport(0, 0, extent.Width, extent.Height, 0, 1);
+            }
+
+            var maxX = (float)extent.Width;
+            var maxY = (float)extent.Height;
+            var left = Math.Clamp(rect.X, 0f, maxX);
+            var right = Math.Clamp(rect.X + rect.Width, left, maxX);
+            var yOrigin = Math.Clamp(rect.Y, 0f, maxY);
+            var yEnd = Math.Clamp(rect.Y + rect.Height, 0f, maxY);
+            var minDepth = Math.Clamp(rect.MinDepth, 0f, 1f);
+            var maxDepth = Math.Clamp(rect.MaxDepth, minDepth, 1f);
+            return new Viewport(
+                left,
+                yOrigin,
+                right - left,
+                yEnd - yOrigin,
+                minDepth,
+                maxDepth);
+        }
 
         private static byte[] CreateFallbackTexturePixels(uint format, uint width, uint height, ulong expectedSize)
         {
@@ -3251,7 +3724,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Format = format,
                 Samples = SampleCountFlags.Count1Bit,
-                LoadOp = AttachmentLoadOp.DontCare,
+                LoadOp = AttachmentLoadOp.Load,
                 StoreOp = AttachmentStoreOp.Store,
                 StencilLoadOp = AttachmentLoadOp.DontCare,
                 StencilStoreOp = AttachmentStoreOp.DontCare,
@@ -3410,11 +3883,12 @@ internal static unsafe class VulkanVideoPresenter
             Format format,
             uint mipLevel,
             uint levelCount,
+            uint dstSelect,
             out ImageView view)
         {
             try
             {
-                view = GetOrCreateGuestImageView(resource, format, mipLevel, levelCount);
+                view = GetOrCreateGuestImageView(resource, format, mipLevel, levelCount, dstSelect);
                 return true;
             }
             catch (Exception exception)
@@ -3431,7 +3905,8 @@ internal static unsafe class VulkanVideoPresenter
             GuestImageResource resource,
             Format format,
             uint mipLevel,
-            uint levelCount)
+            uint levelCount,
+            uint dstSelect = 0xFAC)
         {
             if (mipLevel >= resource.MipLevels)
             {
@@ -3441,7 +3916,7 @@ internal static unsafe class VulkanVideoPresenter
 
             levelCount = Math.Max(levelCount, 1);
             levelCount = Math.Min(levelCount, resource.MipLevels - mipLevel);
-            if (format == resource.Format)
+            if (format == resource.Format && dstSelect == 0xFAC)
             {
                 if (mipLevel == 0 && levelCount == resource.MipLevels)
                 {
@@ -3460,7 +3935,7 @@ internal static unsafe class VulkanVideoPresenter
                     $"Incompatible image view format {format} for image {resource.Format}.");
             }
 
-            var key = (format, mipLevel, levelCount);
+            var key = (format, mipLevel, levelCount, dstSelect);
             if (resource.FormatViews.TryGetValue(key, out var existing))
             {
                 return existing;
@@ -3472,11 +3947,7 @@ internal static unsafe class VulkanVideoPresenter
                 Image = resource.Image,
                 ViewType = ImageViewType.Type2D,
                 Format = format,
-                Components = new ComponentMapping(
-                    ComponentSwizzle.Identity,
-                    ComponentSwizzle.Identity,
-                    ComponentSwizzle.Identity,
-                    ComponentSwizzle.Identity),
+                Components = ToVkComponentMapping(dstSelect),
                 SubresourceRange = ColorSubresourceRange(mipLevel, levelCount),
             };
             ImageView view;
@@ -3491,7 +3962,7 @@ internal static unsafe class VulkanVideoPresenter
             TraceVulkanShader(
                 $"vk.texture_alias_view addr=0x{resource.Address:X16} " +
                 $"image_format={resource.Format} view_format={format} " +
-                $"mip={mipLevel} levels={levelCount}");
+                $"mip={mipLevel} levels={levelCount} dst=0x{dstSelect:X3}");
             return view;
         }
 
@@ -3946,6 +4417,7 @@ internal static unsafe class VulkanVideoPresenter
                         $"nonzero_bytes={nonzeroBytes}/{byteCount} " +
                         $"nonblack_pixels={nonblackPixels}/{(ulong)image.Width * image.Height} " +
                         $"center={center} hash=0x{hash:X16}");
+                    DumpGuestImageBytes(image, bytes);
                 }
                 finally
                 {
@@ -3957,6 +4429,24 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyBuffer(_device, buffer, null);
                 _vk.FreeMemory(_device, memory, null);
             }
+        }
+
+        private static void DumpGuestImageBytes(
+            GuestImageResource image,
+            ReadOnlySpan<byte> bytes)
+        {
+            var directory =
+                Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_DUMP_DIR");
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                return;
+            }
+
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(
+                directory,
+                $"0x{image.Address:X16}-{image.Width}x{image.Height}-{image.Format}.rgba");
+            File.WriteAllBytes(path, bytes.ToArray());
         }
 
         private static uint GetReadbackBytesPerPixel(Format format) =>
@@ -4066,6 +4556,9 @@ internal static unsafe class VulkanVideoPresenter
 
                 var copyRegion = new BufferImageCopy
                 {
+                    BufferRowLength = texture.RowLength > texture.Width
+                        ? texture.RowLength
+                        : 0,
                     ImageSubresource = new ImageSubresourceLayers
                     {
                         AspectMask = ImageAspectFlags.ColorBit,
@@ -4342,16 +4835,47 @@ internal static unsafe class VulkanVideoPresenter
                     null);
             }
 
+            var drawScissor = ClampScissor(resources.Scissor, extent);
+            if (drawScissor.Width == 0 || drawScissor.Height == 0)
+            {
+                _vk.CmdEndRenderPass(_commandBuffer);
+                return;
+            }
+
+            var drawViewport = ClampViewport(resources.Viewport, extent);
+            _vk.CmdSetViewport(_commandBuffer, 0, 1, &drawViewport);
+            if (resources.VertexBuffers.Length != 0)
+            {
+                var buffers = stackalloc VkBuffer[resources.VertexBuffers.Length];
+                var offsets = stackalloc ulong[resources.VertexBuffers.Length];
+                for (var index = 0; index < resources.VertexBuffers.Length; index++)
+                {
+                    buffers[index] = resources.VertexBuffers[index].Buffer;
+                    offsets[index] = GetVertexBindingOffset(resources.VertexBuffers[index]);
+                }
+
+                _vk.CmdBindVertexBuffers(
+                    _commandBuffer,
+                    0,
+                    (uint)resources.VertexBuffers.Length,
+                    buffers,
+                    offsets);
+            }
+
             const uint maxPixelsPerDraw = 512 * 512;
             var rowsPerDraw = Math.Max(
                 1u,
-                Math.Min(extent.Height, maxPixelsPerDraw / Math.Max(extent.Width, 1u)));
+                Math.Min(drawScissor.Height, maxPixelsPerDraw / Math.Max(drawScissor.Width, 1u)));
             var drawCount = 0u;
-            for (var y = 0u; y < extent.Height; y += rowsPerDraw)
+            for (var y = 0u; y < drawScissor.Height; y += rowsPerDraw)
             {
                 var scissor = new Rect2D(
-                    new Offset2D(0, checked((int)y)),
-                    new Extent2D(extent.Width, Math.Min(rowsPerDraw, extent.Height - y)));
+                    new Offset2D(
+                        drawScissor.X,
+                        checked(drawScissor.Y + (int)y)),
+                    new Extent2D(
+                        drawScissor.Width,
+                        Math.Min(rowsPerDraw, drawScissor.Height - y)));
                 _vk.CmdSetScissor(_commandBuffer, 0, 1, &scissor);
 
                 if (resources.IndexBuffer.Handle != 0)
@@ -4386,7 +4910,11 @@ internal static unsafe class VulkanVideoPresenter
             {
                 TraceVulkanShader(
                     $"vk.graphics_chunked target={extent.Width}x{extent.Height} " +
-                    $"draws={drawCount} rows={rowsPerDraw} name={resources.DebugName}");
+                    $"draws={drawCount} rows={rowsPerDraw} " +
+                    $"scissor={drawScissor.X},{drawScissor.Y},{drawScissor.Width}x{drawScissor.Height} " +
+                    $"viewport={drawViewport.X:0.###},{drawViewport.Y:0.###}," +
+                    $"{drawViewport.Width:0.###}x{drawViewport.Height:0.###} " +
+                    $"name={resources.DebugName}");
             }
             _vk.CmdEndRenderPass(_commandBuffer);
         }
@@ -4425,6 +4953,11 @@ internal static unsafe class VulkanVideoPresenter
                     _vk.FreeMemory(_device, texture.StagingMemory, null);
                 }
 
+                if (texture.Sampler.Handle != 0)
+                {
+                    _vk.DestroySampler(_device, texture.Sampler, null);
+                }
+
                 if (texture.NeedsUpload &&
                     texture.GuestImage is { Initialized: false } guestImage)
                 {
@@ -4450,6 +4983,24 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            foreach (var vertexBuffer in resources.VertexBuffers)
+            {
+                if (vertexBuffer is null)
+                {
+                    continue;
+                }
+
+                if (vertexBuffer.Buffer.Handle != 0)
+                {
+                    _vk.DestroyBuffer(_device, vertexBuffer.Buffer, null);
+                }
+
+                if (vertexBuffer.Memory.Handle != 0)
+                {
+                    _vk.FreeMemory(_device, vertexBuffer.Memory, null);
+                }
+            }
+
             if (resources.IndexBuffer.Handle != 0)
             {
                 _vk.DestroyBuffer(_device, resources.IndexBuffer, null);
@@ -4468,11 +5019,6 @@ internal static unsafe class VulkanVideoPresenter
             if (resources.DescriptorPool.Handle != 0)
             {
                 _vk.DestroyDescriptorPool(_device, resources.DescriptorPool, null);
-            }
-
-            if (resources.Sampler.Handle != 0)
-            {
-                _vk.DestroySampler(_device, resources.Sampler, null);
             }
 
             if (resources.PipelineLayout.Handle != 0)
@@ -4565,10 +5111,10 @@ internal static unsafe class VulkanVideoPresenter
             {
                 var fallbackWidth = _extent.Width != 0
                     ? _extent.Width
-                    : Math.Max(_windowWidth, 1u);
+                    : DefaultWindowWidth;
                 var fallbackHeight = _extent.Height != 0
                     ? _extent.Height
-                    : Math.Max(_windowHeight, 1u);
+                    : DefaultWindowHeight;
                 return new Extent2D(
                     ClampSurfaceExtent(
                         capabilities.CurrentExtent.Width,
@@ -4586,12 +5132,12 @@ internal static unsafe class VulkanVideoPresenter
             return new Extent2D(
                 ClampSurfaceExtent(
                     (uint)Math.Max(size.X, 1),
-                    Math.Max(_windowWidth, 1u),
+                    DefaultWindowWidth,
                     capabilities.MinImageExtent.Width,
                     capabilities.MaxImageExtent.Width),
                 ClampSurfaceExtent(
                     (uint)Math.Max(size.Y, 1),
-                    Math.Max(_windowHeight, 1u),
+                    DefaultWindowHeight,
                     capabilities.MinImageExtent.Height,
                     capabilities.MaxImageExtent.Height));
         }

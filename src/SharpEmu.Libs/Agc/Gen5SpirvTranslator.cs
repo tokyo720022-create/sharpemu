@@ -8,6 +8,7 @@ internal static partial class Gen5SpirvTranslator
     private const uint ScalarRegisterCount = 256;
     private const uint VectorRegisterCount = 512;
     private const uint LdsDwordCount = 8192;
+    private const uint RdnaWaveLaneCount = 32;
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -95,6 +96,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
+        private readonly Dictionary<uint, SpirvVertexInput> _vertexInputsByPc = [];
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
@@ -149,6 +151,11 @@ internal static partial class Gen5SpirvTranslator
             uint VectorType,
             ImageComponentKind ComponentKind,
             bool IsStorage);
+
+        private readonly record struct SpirvVertexInput(
+            uint Variable,
+            uint Type,
+            uint ComponentCount);
 
         public CompilationContext(
             Gen5SpirvStage stage,
@@ -283,7 +290,10 @@ internal static partial class Gen5SpirvTranslator
                     _module.Build(),
                     _evaluation.GlobalMemoryBindings,
                     _evaluation.ImageBindings,
-                    attributeCount);
+                    attributeCount,
+                    _stage == Gen5SpirvStage.Vertex
+                        ? _evaluation.VertexInputs ?? []
+                        : []);
                 return true;
             }
             catch (Exception exception)
@@ -298,6 +308,19 @@ internal static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
+            if (_evaluation.ImageBindings.Any(
+                    static binding =>
+                        (binding.Opcode.StartsWith(
+                             "ImageSample",
+                             StringComparison.Ordinal) ||
+                         binding.Opcode.StartsWith(
+                             "ImageGather4",
+                             StringComparison.Ordinal)) &&
+                        binding.Opcode.EndsWith("O", StringComparison.Ordinal)))
+            {
+                _module.AddCapability(SpirvCapability.ImageGatherExtended);
+            }
+
             if (UsesSubgroupOperations())
             {
                 _module.AddCapability(SpirvCapability.GroupNonUniform);
@@ -389,10 +412,6 @@ internal static partial class Gen5SpirvTranslator
             }
 
             var ldsArrayType = _module.TypeArray(_uintType, LdsDwordCount);
-            _module.AddDecoration(
-                ldsArrayType,
-                SpirvDecoration.ArrayStride,
-                sizeof(uint));
             var ldsPointer =
                 _module.TypePointer(SpirvStorageClass.Workgroup, ldsArrayType);
             _workgroupUintPointer =
@@ -466,6 +485,11 @@ internal static partial class Gen5SpirvTranslator
                     _module.AddCapability(
                         SpirvCapability.StorageImageWriteWithoutFormat);
                 }
+                else if (isStorage && RequiresExtendedStorageImageFormat(format))
+                {
+                    _module.AddCapability(
+                        SpirvCapability.StorageImageExtendedFormats);
+                }
 
                 var imageType = _module.TypeImage(
                     componentType,
@@ -502,6 +526,13 @@ internal static partial class Gen5SpirvTranslator
                 _interfaces.Add(variable);
             }
         }
+
+        private static bool RequiresExtendedStorageImageFormat(
+            SpirvImageFormat format) =>
+            format is not SpirvImageFormat.Unknown and
+                not SpirvImageFormat.Rgba32f and
+                not SpirvImageFormat.Rgba32i and
+                not SpirvImageFormat.Rgba32ui;
 
         private static (SpirvImageFormat Format, ImageComponentKind Kind)
             DecodeImageFormat(IReadOnlyList<uint> descriptor)
@@ -583,6 +614,8 @@ internal static partial class Gen5SpirvTranslator
 
             if (_stage == Gen5SpirvStage.Vertex)
             {
+                DeclareVertexInputs();
+
                 var inputPointer =
                     _module.TypePointer(SpirvStorageClass.Input, _uintType);
                 _vertexIndexInput = _module.AddGlobalVariable(
@@ -628,7 +661,6 @@ internal static partial class Gen5SpirvTranslator
                         outputPointer,
                         SpirvStorageClass.Output);
                     _module.AddDecoration(variable, SpirvDecoration.Location, parameter);
-                    _module.AddDecoration(variable, SpirvDecoration.NoPerspective);
                     _vertexOutputs.Add(parameter, variable);
                     _interfaces.Add(variable);
                 }
@@ -650,7 +682,6 @@ internal static partial class Gen5SpirvTranslator
                         inputVec4Pointer,
                         SpirvStorageClass.Input);
                     _module.AddDecoration(variable, SpirvDecoration.Location, attribute);
-                    _module.AddDecoration(variable, SpirvDecoration.NoPerspective);
                     _pixelInputs.Add(attribute, variable);
                     _interfaces.Add(variable);
                 }
@@ -698,6 +729,42 @@ internal static partial class Gen5SpirvTranslator
                     (uint)SpirvBuiltIn.WorkgroupId);
                 _interfaces.Add(_localInvocationIdInput);
                 _interfaces.Add(_workGroupIdInput);
+            }
+        }
+
+        private void DeclareVertexInputs()
+        {
+            foreach (var input in _evaluation.VertexInputs ?? [])
+            {
+                var type = input.ComponentCount switch
+                {
+                    1u => _floatType,
+                    2u => _vec2Type,
+                    3u => _vec3Type,
+                    4u => _vec4Type,
+                    _ => 0u,
+                };
+                if (type == 0)
+                {
+                    continue;
+                }
+
+                var pointer = _module.TypePointer(SpirvStorageClass.Input, type);
+                var variable = _module.AddGlobalVariable(
+                    pointer,
+                    SpirvStorageClass.Input);
+                _module.AddName(variable, $"attr{input.Location}");
+                _module.AddDecoration(
+                    variable,
+                    SpirvDecoration.Location,
+                    input.Location);
+                _vertexInputsByPc.TryAdd(
+                    input.Pc,
+                    new SpirvVertexInput(
+                        variable,
+                        type,
+                        input.ComponentCount));
+                _interfaces.Add(variable);
             }
         }
 
@@ -1287,6 +1354,19 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (_stage == Gen5SpirvStage.Vertex &&
+                _vertexInputsByPc.TryGetValue(instruction.Pc, out var vertexInput))
+            {
+                return TryEmitVertexInputFetch(control, vertexInput, out error);
+            }
+
+            if (_stage == Gen5SpirvStage.Vertex &&
+                IsFormatBufferLoad(instruction.Opcode))
+            {
+                error = $"missing vertex input for {instruction.Opcode} pc=0x{instruction.Pc:X}";
+                return false;
+            }
+
             if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex))
             {
                 error = "missing buffer-memory binding";
@@ -1372,6 +1452,41 @@ internal static partial class Gen5SpirvTranslator
             return true;
         }
 
+        private static bool IsFormatBufferLoad(string opcode) =>
+            opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal) ||
+            opcode.StartsWith("TBufferLoadFormat", StringComparison.Ordinal);
+
+        private bool TryEmitVertexInputFetch(
+            Gen5BufferMemoryControl control,
+            SpirvVertexInput input,
+            out string error)
+        {
+            error = string.Empty;
+            if (control.DwordCount == 0 ||
+                control.DwordCount > input.ComponentCount)
+            {
+                error =
+                    $"invalid vertex input fetch components={control.DwordCount} " +
+                    $"input={input.ComponentCount}";
+                return false;
+            }
+
+            var loaded = Load(input.Type, input.Variable);
+            for (uint component = 0; component < control.DwordCount; component++)
+            {
+                var value = input.ComponentCount == 1
+                    ? loaded
+                    : _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        loaded,
+                        component);
+                StoreV(control.VectorData + component, Bitcast(_uintType, value));
+            }
+
+            return true;
+        }
+
         private bool TryEmitImage(
             Gen5ShaderInstruction instruction,
             Gen5ImageControl image,
@@ -1389,11 +1504,20 @@ internal static partial class Gen5SpirvTranslator
             var imageObject = Load(resource.ObjectType, resource.Variable);
             if (instruction.Opcode == "ImageGetResinfo")
             {
+                var queryImage = resource.IsStorage
+                    ? imageObject
+                    : _module.AddInstruction(
+                        SpirvOp.Image,
+                        resource.ImageType,
+                        imageObject);
                 var size = _module.AddInstruction(
-                    SpirvOp.ImageQuerySizeLod,
+                    resource.IsStorage
+                        ? SpirvOp.ImageQuerySize
+                        : SpirvOp.ImageQuerySizeLod,
                     _module.TypeVector(_intType, 2),
-                    imageObject,
-                    UInt(0));
+                    resource.IsStorage
+                        ? [queryImage]
+                        : [queryImage, UInt(0)]);
                 uint outputIndex = 0;
                 for (uint component = 0; component < 4; component++)
                 {
@@ -1504,10 +1628,14 @@ internal static partial class Gen5SpirvTranslator
                     ? BuildClampedIntegerCoordinates(image, 0, width, height)
                     : BuildIntegerCoordinates(image, 0);
                 var mipLevel = _evaluation.ImageBindings[bindingIndex].MipLevel ?? 0;
+                var fetchedImage = _module.AddInstruction(
+                    SpirvOp.Image,
+                    resource.ImageType,
+                    imageObject);
                 sampled = _module.AddInstruction(
                     SpirvOp.ImageFetch,
                     resource.VectorType,
-                    imageObject,
+                    fetchedImage,
                     coordinates,
                     2,
                     UInt(mipLevel));
@@ -2057,18 +2185,13 @@ internal static partial class Gen5SpirvTranslator
         private void StoreS(uint register, uint value)
         {
             Store(ScalarPointer(register), value);
-            if (_subgroupInvocationIdInput == 0)
-            {
-                return;
-            }
-
             if (register is 106 or 107)
             {
-                Store(_vcc, IsCurrentLaneSet(LoadS64(106)));
+                Store(_vcc, IsWaveMaskActive(LoadS64(106)));
             }
             else if (register is 126 or 127)
             {
-                Store(_exec, IsCurrentLaneSet(LoadS64(126)));
+                Store(_exec, IsWaveMaskActive(LoadS64(126)));
             }
         }
 
@@ -2105,11 +2228,48 @@ internal static partial class Gen5SpirvTranslator
         private uint IAdd(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.IAdd, _uintType, left, right);
 
+        private uint ShiftLeftLogical(uint left, uint right) =>
+            _module.AddInstruction(
+                SpirvOp.ShiftLeftLogical,
+                _uintType,
+                left,
+                BitwiseAnd(right, UInt(31)));
+
         private uint ShiftRightLogical(uint left, uint right) =>
-            _module.AddInstruction(SpirvOp.ShiftRightLogical, _uintType, left, right);
+            _module.AddInstruction(
+                SpirvOp.ShiftRightLogical,
+                _uintType,
+                left,
+                BitwiseAnd(right, UInt(31)));
+
+        private uint ShiftRightArithmetic(uint left, uint right) =>
+            Bitcast(
+                _uintType,
+                _module.AddInstruction(
+                    SpirvOp.ShiftRightArithmetic,
+                    _intType,
+                    Bitcast(_intType, left),
+                    BitwiseAnd(right, UInt(31))));
+
+        private uint ShiftLeftLogical64(uint left, uint right) =>
+            _module.AddInstruction(
+                SpirvOp.ShiftLeftLogical,
+                _ulongType,
+                left,
+                BitwiseAnd64(right, _module.Constant64(_ulongType, 63)));
+
+        private uint ShiftRightLogical64(uint left, uint right) =>
+            _module.AddInstruction(
+                SpirvOp.ShiftRightLogical,
+                _ulongType,
+                left,
+                BitwiseAnd64(right, _module.Constant64(_ulongType, 63)));
 
         private uint BitwiseAnd(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.BitwiseAnd, _uintType, left, right);
+
+        private uint BitwiseAnd64(uint left, uint right) =>
+            _module.AddInstruction(SpirvOp.BitwiseAnd, _ulongType, left, right);
 
         private uint BitwiseOr(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.BitwiseOr, _uintType, left, right);
@@ -2121,24 +2281,43 @@ internal static partial class Gen5SpirvTranslator
             _module.AddInstruction(SpirvOp.LogicalNot, _boolType, value);
 
         private uint SubgroupAny(uint condition) =>
-            _module.AddInstruction(
-                SpirvOp.GroupNonUniformAny,
-                _boolType,
-                UInt(3),
-                condition);
+            _subgroupInvocationIdInput == 0
+                ? condition
+                : _module.AddInstruction(
+                    SpirvOp.GroupNonUniformAny,
+                    _boolType,
+                    UInt(3),
+                    condition);
 
         private uint CurrentLaneBit()
         {
-            var lane = _module.AddInstruction(
-                SpirvOp.UConvert,
-                _ulongType,
-                Load(_uintType, _subgroupInvocationIdInput));
-            return _module.AddInstruction(
-                SpirvOp.ShiftLeftLogical,
-                _ulongType,
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return _module.Constant64(_ulongType, 1);
+            }
+
+            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var maskedLane = BitwiseAnd(lane, UInt(RdnaWaveLaneCount - 1));
+            var shifted = ShiftLeftLogical64(
                 _module.Constant64(_ulongType, 1),
-                lane);
+                _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    maskedLane));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _ulongType,
+                IsCurrentLaneInRdnaWave(),
+                shifted,
+                _module.Constant64(_ulongType, 0));
         }
+
+        private uint IsCurrentLaneInRdnaWave() =>
+            _module.AddInstruction(
+                SpirvOp.ULessThan,
+                _boolType,
+                Load(_uintType, _subgroupInvocationIdInput),
+                UInt(RdnaWaveLaneCount));
 
         private uint BooleanToLaneMask(uint condition) =>
             _module.AddInstruction(
@@ -2147,6 +2326,11 @@ internal static partial class Gen5SpirvTranslator
                 condition,
                 CurrentLaneBit(),
                 _module.Constant64(_ulongType, 0));
+
+        private uint IsWaveMaskActive(uint mask) =>
+            _subgroupInvocationIdInput == 0
+                ? IsNotZero64(mask)
+                : IsCurrentLaneSet(mask);
 
         private uint IsCurrentLaneSet(uint mask) =>
             IsNotZero64(
@@ -2163,10 +2347,11 @@ internal static partial class Gen5SpirvTranslator
         {
             var activeLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
+            var active = Load(_boolType, _exec);
             _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
             _module.AddStatement(
                 SpirvOp.BranchConditional,
-                Load(_boolType, _exec),
+                active,
                 activeLabel,
                 mergeLabel);
             _module.AddLabel(activeLabel);
@@ -2193,7 +2378,8 @@ internal static partial class Gen5SpirvTranslator
                 instruction.Destinations.Any(IsWaveMaskOperand));
 
         private bool UsesSubgroupOperations() =>
-            UsesSubgroupShuffle() || UsesWaveControl();
+            _stage == Gen5SpirvStage.Compute &&
+            (UsesSubgroupShuffle() || UsesWaveControl());
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

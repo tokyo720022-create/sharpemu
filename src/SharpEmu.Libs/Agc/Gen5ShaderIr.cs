@@ -60,7 +60,8 @@ internal sealed record Gen5SpirvShader(
     byte[] Spirv,
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
     IReadOnlyList<Gen5ImageBinding> ImageBindings,
-    uint AttributeCount);
+    uint AttributeCount,
+    IReadOnlyList<Gen5VertexInputBinding> VertexInputs);
 
 internal readonly record struct Gen5ShaderResourceMapping(
     Gen5ShaderResourceKind Kind,
@@ -271,6 +272,15 @@ internal sealed record Gen5GlobalMemoryBinding(
     IReadOnlyList<uint> InstructionPcs,
     byte[] Data);
 
+internal sealed record Gen5VertexInputBinding(
+    uint Pc,
+    uint Location,
+    uint ComponentCount,
+    ulong BaseAddress,
+    uint Stride,
+    uint OffsetBytes,
+    byte[] Data);
+
 internal sealed record Gen5ShaderEvaluation(
     IReadOnlyList<uint> InitialScalarRegisters,
     IReadOnlyList<uint> ScalarRegisters,
@@ -278,7 +288,8 @@ internal sealed record Gen5ShaderEvaluation(
     IReadOnlyList<Gen5ImageBinding> ImageBindings,
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
-    IReadOnlySet<uint>? RuntimeScalarRegisters = null);
+    IReadOnlySet<uint>? RuntimeScalarRegisters = null,
+    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null);
 
 internal sealed record Gen5ShaderInstruction(
     uint Pc,

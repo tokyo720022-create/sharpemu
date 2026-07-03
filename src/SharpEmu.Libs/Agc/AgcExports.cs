@@ -68,13 +68,35 @@ public static class AgcExports
     private const uint ComputeNumThreadZ = 0x209;
     private const uint SpiPsInputCntl0 = 0x191;
     private const uint VgtPrimitiveType = 0x242;
+    private const uint PaScScreenScissorTl = 0x0C;
+    private const uint PaScScreenScissorBr = 0x0D;
     private const uint CbTargetMask = 0x8E;
+    private const uint PaScWindowOffset = 0x80;
+    private const uint PaScWindowScissorTl = 0x81;
+    private const uint PaScWindowScissorBr = 0x82;
+    private const uint PaScGenericScissorTl = 0x90;
+    private const uint PaScGenericScissorBr = 0x91;
+    private const uint PaScVportScissor0Tl = 0x94;
+    private const uint PaScVportScissor0Br = 0x95;
+    private const uint PaClVportXScale = 0x10F;
+    private const uint PaClVportXOffset = 0x110;
+    private const uint PaClVportYScale = 0x111;
+    private const uint PaClVportYOffset = 0x112;
+    private const uint PaScVportZMin0 = 0xB4;
+    private const uint PaScVportZMax0 = 0xB5;
+    private const uint CbBlendRed = 0x105;
+    private const uint CbBlendGreen = 0x106;
+    private const uint CbBlendBlue = 0x107;
+    private const uint CbBlendAlpha = 0x108;
+    private const uint CbColorControl = 0x202;
     private const uint CbColor0Base = 0x318;
     private const uint CbColorRegisterStride = 15;
     private const uint CbColor0Info = 0x31C;
     private const uint CbColor0BaseExt = 0x390;
     private const uint CbColor0Attrib2 = 0x3B0;
     private const uint CbColor0Attrib3 = 0x3B8;
+    private const uint CbBlend0Control = 0x1E0;
+    private const uint PaScModeCntl0 = 0x292;
     private const int ColorTargetCount = 8;
     private const uint PsTextureUserDataRegister = 0xC;
     private const uint VsUserDataRegister = 0x4C;
@@ -151,9 +173,25 @@ public static class AgcExports
 
     private static readonly RegisterDefaultGroup[] PrimaryRegisterDefaults =
     [
+        new(0, 0, 0xE24F806D, [new(CbColorControl, 0x00CC0010)]),
         new(0, 3, 0x0BC65DA4, [new(0x08F, 0)]),
         new(0, 4, 0x9E5AD592, [new(0x08E, 0)]),
         new(0, 12, 0x6DE4C312, [new(0x203, 0)]),
+        new(0, 28, 0x1EB8D73A, [new(PaScModeCntl0, 0x00000002)]),
+        new(0, 31, 0xA20EFC70, [new(PaScWindowOffset, 0)]),
+        new(0, 58, 0x43FBD769,
+        [
+            new(CbBlendRed, 0),
+            new(CbBlendBlue, 0),
+            new(CbBlendGreen, 0),
+            new(CbBlendAlpha, 0),
+        ]),
+        new(0, 59, 0xEF550356, [new(CbBlend0Control, 0x20010001)]),
+        new(0, 67, 0x918106BB,
+        [
+            new(PaScGenericScissorTl, 0x80000000),
+            new(PaScGenericScissorBr, 0x40004000),
+        ]),
         new(0, 72, 0x38E92C91,
         [
             new(0x318, 0),
@@ -187,6 +225,11 @@ public static class AgcExports
             new(0x095, 0x40004000),
             new(0x0B4, 0),
             new(0x0B5, 0),
+        ]),
+        new(0, 77, 0x078D7060,
+        [
+            new(PaScWindowScissorTl, 0x80000000),
+            new(PaScWindowScissorBr, 0x40004000),
         ]),
         new(1, 13, 0xC918DF3E, [new(0x20C, 0), new(0x20D, 0)]),
         new(1, 14, 0xC9751C9C, [new(0x0C8, 0), new(0x0C9, 0)]),
@@ -231,7 +274,9 @@ public static class AgcExports
         uint TileMode,
         uint Type,
         uint BaseLevel,
-        uint LastLevel)
+        uint LastLevel,
+        uint Pitch,
+        uint DstSelect)
     {
         public uint MipLevels
         {
@@ -274,12 +319,15 @@ public static class AgcExports
         VulkanGuestIndexBuffer? IndexBuffer,
         IReadOnlyList<TranslatedImageBinding> Textures,
         IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
-        IReadOnlyList<RenderTargetDescriptor> RenderTargets);
+        IReadOnlyList<Gen5VertexInputBinding> VertexInputs,
+        IReadOnlyList<RenderTargetDescriptor> RenderTargets,
+        VulkanGuestRenderState RenderState);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
         bool IsStorage,
-        uint MipLevel);
+        uint MipLevel,
+        IReadOnlyList<uint> SamplerDescriptor);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -2770,11 +2818,13 @@ public static class AgcExports
                     out _);
                 var globalMemoryBuffers =
                     CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
-                    VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
-                        translatedDraw.PixelSpirv,
-                        textures,
-                        globalMemoryBuffers,
-                        translatedDraw.AttributeCount,
+                var vertexBuffers =
+                    CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
+                    translatedDraw.PixelSpirv,
+                    textures,
+                    globalMemoryBuffers,
+                    translatedDraw.AttributeCount,
                     new VulkanGuestRenderTarget(
                         firstTarget.Address,
                         firstTarget.Width,
@@ -2785,7 +2835,9 @@ public static class AgcExports
                         translatedDraw.VertexCount,
                         translatedDraw.InstanceCount,
                         translatedDraw.PrimitiveType,
-                        translatedDraw.IndexBuffer);
+                        translatedDraw.IndexBuffer,
+                        vertexBuffers,
+                        translatedDraw.RenderState);
             }
             else
             {
@@ -2884,7 +2936,8 @@ public static class AgcExports
                 ctx,
                 exportState,
                 out var exportEvaluation,
-                out error) ||
+                out error,
+                resolveVertexInputs: true) ||
             !Gen5ShaderTranslator.TryCreateState(
                 ctx,
                 pixelShaderAddress,
@@ -2984,12 +3037,15 @@ public static class AgcExports
                 new TranslatedImageBinding(
                     texture,
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
-                    binding.MipLevel ?? 0));
+                    binding.MipLevel ?? 0,
+                    binding.SamplerDescriptor));
         }
 
         var globalMemoryBindings = pixelEvaluation.GlobalMemoryBindings
             .Concat(exportEvaluation.GlobalMemoryBindings)
             .ToArray();
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
+            exportEvaluation.VertexInputs ?? [];
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         draw = new TranslatedGuestDraw(
             exportShaderAddress,
@@ -3003,7 +3059,9 @@ public static class AgcExports
             indexed ? CreateVulkanIndexBuffer(ctx, state, vertexCount) : null,
             textures,
             globalMemoryBindings,
-            renderTargets);
+            vertexInputs,
+            renderTargets,
+            CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()));
         return true;
     }
 
@@ -3115,6 +3173,246 @@ public static class AgcExports
         return targets;
     }
 
+    private static VulkanGuestRenderState CreateRenderState(
+        IReadOnlyDictionary<uint, uint> registers,
+        RenderTargetDescriptor target)
+    {
+        var scissor = DecodeScissor(registers, target.Width, target.Height);
+        return new VulkanGuestRenderState(
+            DecodeBlendState(registers, target.Slot),
+            scissor,
+            DecodeViewport(registers, target.Width, target.Height, scissor));
+    }
+
+    private static VulkanGuestBlendState DecodeBlendState(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint slot)
+    {
+        var writeMask = 0xFu;
+        if (registers.TryGetValue(CbTargetMask, out var targetMask))
+        {
+            writeMask = (targetMask >> checked((int)(slot * 4))) & 0xFu;
+        }
+
+        registers.TryGetValue(CbBlend0Control + slot, out var control);
+        return new VulkanGuestBlendState(
+            ((control >> 30) & 1u) != 0,
+            control & 0x1Fu,
+            (control >> 8) & 0x1Fu,
+            (control >> 5) & 0x7u,
+            (control >> 16) & 0x1Fu,
+            (control >> 24) & 0x1Fu,
+            (control >> 21) & 0x7u,
+            ((control >> 29) & 1u) != 0,
+            writeMask == 0 ? 0xFu : writeMask);
+    }
+
+    private static VulkanGuestRect? DecodeScissor(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint targetWidth,
+        uint targetHeight)
+    {
+        if (targetWidth == 0 || targetHeight == 0)
+        {
+            return new VulkanGuestRect(0, 0, 0, 0);
+        }
+
+        var left = 0;
+        var top = 0;
+        var right = checked((int)Math.Min(targetWidth, int.MaxValue));
+        var bottom = checked((int)Math.Min(targetHeight, int.MaxValue));
+
+        var windowOffsetX = 0;
+        var windowOffsetY = 0;
+        var enableWindowOffset = true;
+        if (registers.TryGetValue(PaScWindowScissorTl, out var windowScissorTl))
+        {
+            enableWindowOffset = (windowScissorTl & 0x80000000u) == 0;
+        }
+
+        if (enableWindowOffset &&
+            registers.TryGetValue(PaScWindowOffset, out var windowOffset))
+        {
+            windowOffsetX = (short)(windowOffset & 0xFFFFu);
+            windowOffsetY = (short)(windowOffset >> 16);
+        }
+
+        IntersectScissorPair(registers, PaScScreenScissorTl, PaScScreenScissorBr, ref left, ref top, ref right, ref bottom);
+        IntersectScissorPair(
+            registers,
+            PaScWindowScissorTl,
+            PaScWindowScissorBr,
+            ref left,
+            ref top,
+            ref right,
+            ref bottom,
+            windowOffsetX,
+            windowOffsetY);
+        IntersectScissorPair(
+            registers,
+            PaScGenericScissorTl,
+            PaScGenericScissorBr,
+            ref left,
+            ref top,
+            ref right,
+            ref bottom,
+            windowOffsetX,
+            windowOffsetY);
+        var vportScissorEnabled =
+            !registers.TryGetValue(PaScModeCntl0, out var modeControl) ||
+            ((modeControl >> 1) & 1u) != 0;
+        if (vportScissorEnabled)
+        {
+            IntersectScissorPair(registers, PaScVportScissor0Tl, PaScVportScissor0Br, ref left, ref top, ref right, ref bottom);
+        }
+
+        left = Math.Clamp(left, 0, checked((int)targetWidth));
+        top = Math.Clamp(top, 0, checked((int)targetHeight));
+        right = Math.Clamp(right, left, checked((int)targetWidth));
+        bottom = Math.Clamp(bottom, top, checked((int)targetHeight));
+
+        if (left == 0 &&
+            top == 0 &&
+            right == (int)targetWidth &&
+            bottom == (int)targetHeight)
+        {
+            return null;
+        }
+
+        return new VulkanGuestRect(
+            left,
+            top,
+            checked((uint)(right - left)),
+            checked((uint)(bottom - top)));
+    }
+
+    private static VulkanGuestViewport? DecodeViewport(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint targetWidth,
+        uint targetHeight,
+        VulkanGuestRect? scissor)
+    {
+        if (targetWidth == 0 || targetHeight == 0)
+        {
+            return new VulkanGuestViewport(0, 0, 0, 0, 0, 1);
+        }
+
+        var minDepth = 0f;
+        var maxDepth = 1f;
+        if (registers.TryGetValue(PaScVportZMin0, out var zMinBits) &&
+            registers.TryGetValue(PaScVportZMax0, out var zMaxBits))
+        {
+            var decodedMin = BitConverter.UInt32BitsToSingle(zMinBits);
+            var decodedMax = BitConverter.UInt32BitsToSingle(zMaxBits);
+            if (float.IsFinite(decodedMin) &&
+                float.IsFinite(decodedMax) &&
+                decodedMax > decodedMin)
+            {
+                minDepth = decodedMin;
+                maxDepth = decodedMax;
+            }
+        }
+
+        if (TryDecodeFiniteFloat(registers, PaClVportXScale, out var xScale) &&
+            TryDecodeFiniteFloat(registers, PaClVportXOffset, out var xOffset) &&
+            TryDecodeFiniteFloat(registers, PaClVportYScale, out var yScale) &&
+            TryDecodeFiniteFloat(registers, PaClVportYOffset, out var yOffset) &&
+            xScale > 0f &&
+            yScale != 0f)
+        {
+            return new VulkanGuestViewport(
+                xOffset - xScale,
+                yOffset - yScale,
+                xScale * 2f,
+                yScale * 2f,
+                minDepth,
+                maxDepth);
+        }
+
+        if (scissor is not { } rect)
+        {
+            return minDepth == 0f && maxDepth == 1f
+                ? null
+                : new VulkanGuestViewport(0, 0, targetWidth, targetHeight, minDepth, maxDepth);
+        }
+
+        return new VulkanGuestViewport(
+            rect.X,
+            rect.Y,
+            rect.Width,
+            rect.Height,
+            minDepth,
+            maxDepth);
+    }
+
+    private static bool TryDecodeFiniteFloat(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint register,
+        out float value)
+    {
+        value = 0;
+        if (!registers.TryGetValue(register, out var bits))
+        {
+            return false;
+        }
+
+        value = BitConverter.UInt32BitsToSingle(bits);
+        return float.IsFinite(value);
+    }
+
+    private static void IntersectScissorPair(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint tlRegister,
+        uint brRegister,
+        ref int left,
+        ref int top,
+        ref int right,
+        ref int bottom,
+        int offsetX = 0,
+        int offsetY = 0)
+    {
+        if (!TryDecodeScissorPair(registers, tlRegister, brRegister, out var pairLeft, out var pairTop, out var pairRight, out var pairBottom))
+        {
+            return;
+        }
+
+        pairLeft += offsetX;
+        pairTop += offsetY;
+        pairRight += offsetX;
+        pairBottom += offsetY;
+
+        left = Math.Max(left, pairLeft);
+        top = Math.Max(top, pairTop);
+        right = Math.Min(right, pairRight);
+        bottom = Math.Min(bottom, pairBottom);
+    }
+
+    private static bool TryDecodeScissorPair(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint tlRegister,
+        uint brRegister,
+        out int left,
+        out int top,
+        out int right,
+        out int bottom)
+    {
+        left = 0;
+        top = 0;
+        right = 0;
+        bottom = 0;
+        if (!registers.TryGetValue(tlRegister, out var tl) ||
+            !registers.TryGetValue(brRegister, out var br))
+        {
+            return false;
+        }
+
+        left = (int)(tl & 0x7FFFu);
+        top = (int)((tl >> 16) & 0x7FFFu);
+        right = (int)(br & 0x7FFFu);
+        bottom = (int)((br >> 16) & 0x7FFFu);
+        return true;
+    }
+
     private static void TraceTranslatedGuestDraw(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -3173,13 +3471,31 @@ public static class AgcExports
             ? $"{(indexBuffer.Is32Bit ? 32 : 16)}:" +
               Convert.ToHexString(indexBuffer.Data.AsSpan(0, Math.Min(indexBuffer.Data.Length, 32)))
             : "none";
+        var vertexInputs = draw.VertexInputs.Count == 0
+            ? "none"
+            : string.Join(
+                ',',
+                draw.VertexInputs.Select(input =>
+                    $"{input.Location}:pc=0x{input.Pc:X}:0x{input.BaseAddress:X16}" +
+                    $":stride{input.Stride}:off{input.OffsetBytes}:c{input.ComponentCount}"));
+        var scissor = draw.RenderState.Scissor is { } drawScissor
+            ? $"{drawScissor.X},{drawScissor.Y},{drawScissor.Width}x{drawScissor.Height}"
+            : "full";
+        var viewport = draw.RenderState.Viewport is { } drawViewport
+            ? $"{drawViewport.X:0.###},{drawViewport.Y:0.###}," +
+              $"{drawViewport.Width:0.###}x{drawViewport.Height:0.###}:" +
+              $"{drawViewport.MinDepth:0.###}-{drawViewport.MaxDepth:0.###}"
+            : "full";
+        var blend = draw.RenderState.Blend;
         TraceAgcShader(
             $"agc.shader_draw es=0x{draw.ExportShaderAddress:X16} " +
             $"ps=0x{draw.PixelShaderAddress:X16} spirv={draw.PixelSpirv.Length} " +
             $"primitive=0x{draw.PrimitiveType:X} " +
+            $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc} " +
+            $"write_mask=0x{blend.WriteMask:X} scissor={scissor} viewport={viewport} " +
             $"ps_ena=0x{psInputEna:X8} ps_addr=0x{psInputAddr:X8} " +
             $"targets=[{targets}] textures=[{textures}] " +
-            $"buffers=[{buffers}] indices=[{indices}]");
+            $"buffers=[{buffers}] vertex=[{vertexInputs}] indices=[{indices}]");
     }
 
     private static IReadOnlyList<VulkanGuestDrawTexture> CreateVulkanGuestDrawTextures(
@@ -3196,6 +3512,7 @@ public static class AgcExports
                     binding.Descriptor,
                     binding.IsStorage,
                     binding.MipLevel,
+                    binding.SamplerDescriptor,
                     out var texture))
             {
                 textures.Add(texture);
@@ -3223,11 +3540,31 @@ public static class AgcExports
         return buffers;
     }
 
+    private static IReadOnlyList<VulkanGuestVertexBuffer> CreateVulkanGuestVertexBuffers(
+        IReadOnlyList<Gen5VertexInputBinding> bindings)
+    {
+        var buffers = new VulkanGuestVertexBuffer[bindings.Count];
+        for (var index = 0; index < bindings.Count; index++)
+        {
+            var binding = bindings[index];
+            buffers[index] = new VulkanGuestVertexBuffer(
+                binding.Location,
+                binding.ComponentCount,
+                binding.BaseAddress,
+                binding.Stride,
+                binding.OffsetBytes,
+                binding.Data);
+        }
+
+        return buffers;
+    }
+
     private static bool TryCreateVulkanGuestDrawTexture(
         CpuContext ctx,
         TextureDescriptor descriptor,
         bool isStorage,
         uint mipLevel,
+        IReadOnlyList<uint> samplerDescriptor,
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
@@ -3241,9 +3578,12 @@ public static class AgcExports
             return true;
         }
 
+        var sourceWidth = descriptor.TileMode == 0
+            ? Math.Max(descriptor.Width, descriptor.Pitch)
+            : descriptor.Width;
         var sourceByteCount = GetTextureByteCount(
             descriptor.Format,
-            descriptor.Width,
+            sourceWidth,
             descriptor.Height);
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
@@ -3276,7 +3616,11 @@ public static class AgcExports
                 IsFallback: descriptor.Address == 0,
                 IsStorage: true,
                 MipLevels: descriptor.MipLevels,
-                MipLevel: mipLevel);
+                MipLevel: mipLevel,
+                Pitch: descriptor.Pitch,
+                TileMode: descriptor.TileMode,
+                DstSelect: descriptor.DstSelect,
+                Sampler: ToVulkanSampler(samplerDescriptor));
             return true;
         }
 
@@ -3303,7 +3647,8 @@ public static class AgcExports
         TraceAgcShader(
             $"agc.texture_source addr=0x{descriptor.Address:X16} " +
             $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
-            $"size={descriptor.Width}x{descriptor.Height} " +
+            $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
+            $"dst=0x{descriptor.DstSelect:X3} " +
             $"bytes={source.Length} nonzero64={nonZero}");
 
         var rgba = source;
@@ -3317,7 +3662,11 @@ public static class AgcExports
             IsFallback: false,
             IsStorage: isStorage,
             MipLevels: descriptor.MipLevels,
-            MipLevel: mipLevel);
+            MipLevel: mipLevel,
+            Pitch: descriptor.Pitch,
+            TileMode: descriptor.TileMode,
+            DstSelect: descriptor.DstSelect,
+            Sampler: ToVulkanSampler(samplerDescriptor));
         return true;
     }
 
@@ -3333,6 +3682,15 @@ public static class AgcExports
             IsStorage: isStorage,
             MipLevels: 1,
             MipLevel: 0);
+
+    private static VulkanGuestSampler ToVulkanSampler(IReadOnlyList<uint> descriptor) =>
+        descriptor.Count >= 4
+            ? new VulkanGuestSampler(
+                descriptor[0],
+                descriptor[1],
+                descriptor[2],
+                descriptor[3])
+            : default;
 
     private static byte[] ConvertRgba16FloatToRgba8(ReadOnlySpan<byte> source, uint width, uint height)
     {
@@ -3486,7 +3844,8 @@ public static class AgcExports
                 new TranslatedImageBinding(
                     texture,
                     isStorage,
-                    binding.MipLevel ?? 0));
+                    binding.MipLevel ?? 0,
+                    binding.SamplerDescriptor));
             hasStorageBinding |= isStorage;
 
             var descriptorState = descriptorValid ? string.Empty : "/invalid-desc";
@@ -4248,6 +4607,10 @@ public static class AgcExports
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
         var lastLevel = (fields[3] >> 16) & 0xFu;
+        var pitch = fields.Count >= 5
+            ? ((fields[4] >> 13) & 0x3FFFu) + 1
+            : width;
+        var dstSelect = fields[3] & 0xFFFu;
         if (address == 0 || width == 0 || height == 0)
         {
             return false;
@@ -4262,7 +4625,9 @@ public static class AgcExports
             tileMode,
             type,
             baseLevel,
-            lastLevel);
+            lastLevel,
+            pitch,
+            dstSelect);
         return true;
     }
 
@@ -4291,7 +4656,9 @@ public static class AgcExports
             TileMode: tileMode,
             Type: Gen5TextureType2D,
             BaseLevel: 0,
-            LastLevel: 0);
+            LastLevel: 0,
+            Pitch: 1,
+            DstSelect: 0xFAC);
     }
 
     private static bool TrySoftwarePresent(

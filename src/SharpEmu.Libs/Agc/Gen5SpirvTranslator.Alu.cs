@@ -133,9 +133,7 @@ internal static partial class Gen5SpirvTranslator
                         SpirvOp.ConvertFToU,
                         _uintType,
                         GetFloatSource(instruction, 0));
-                    var offset = _module.AddInstruction(
-                        SpirvOp.ShiftLeftLogical,
-                        _uintType,
+                    var offset = ShiftLeftLogical(
                         BitwiseAnd(GetRawSource(instruction, 1), UInt(3)),
                         UInt(3));
                     result = _module.AddInstruction(
@@ -352,9 +350,7 @@ internal static partial class Gen5SpirvTranslator
                     result = _module.AddInstruction(
                         SpirvOp.UConvert,
                         _uintType,
-                        _module.AddInstruction(
-                            SpirvOp.ShiftRightLogical,
-                            _ulongType,
+                        ShiftRightLogical64(
                             product,
                             _module.Constant64(_ulongType, 32)));
                     break;
@@ -417,21 +413,12 @@ internal static partial class Gen5SpirvTranslator
                     var reverse = instruction.Opcode == "VAshrrevI32";
                     var left = GetRawSource(instruction, reverse ? 1 : 0);
                     var right = GetRawSource(instruction, reverse ? 0 : 1);
-                    right = BitwiseAnd(right, UInt(31));
-                    result = Bitcast(
-                        _uintType,
-                        _module.AddInstruction(
-                            SpirvOp.ShiftRightArithmetic,
-                            _intType,
-                            Bitcast(_intType, left),
-                            right));
+                    result = ShiftRightArithmetic(left, right);
                     break;
                 }
                 case "VLshlAddU32":
                 {
-                    var shifted = _module.AddInstruction(
-                        SpirvOp.ShiftLeftLogical,
-                        _uintType,
+                    var shifted = ShiftLeftLogical(
                         GetRawSource(instruction, 0),
                         BitwiseAnd(GetRawSource(instruction, 1), UInt(31)));
                     result = IAdd(shifted, GetRawSource(instruction, 2));
@@ -439,9 +426,7 @@ internal static partial class Gen5SpirvTranslator
                 }
                 case "VLshlOrU32":
                 {
-                    var shifted = _module.AddInstruction(
-                        SpirvOp.ShiftLeftLogical,
-                        _uintType,
+                    var shifted = ShiftLeftLogical(
                         GetRawSource(instruction, 0),
                         BitwiseAnd(GetRawSource(instruction, 1), UInt(31)));
                     result = BitwiseOr(
@@ -474,11 +459,7 @@ internal static partial class Gen5SpirvTranslator
                     var added = IAdd(
                         GetRawSource(instruction, 0),
                         GetRawSource(instruction, 1));
-                    result = _module.AddInstruction(
-                        SpirvOp.ShiftLeftLogical,
-                        _uintType,
-                        added,
-                        BitwiseAnd(GetRawSource(instruction, 2), UInt(31)));
+                    result = ShiftLeftLogical(added, GetRawSource(instruction, 2));
                     break;
                 }
                 case "VAdd3U32":
@@ -1101,11 +1082,7 @@ internal static partial class Gen5SpirvTranslator
                                 _module.AddInstruction(SpirvOp.Not, _uintType, right));
                             break;
                         case "SLshlB32":
-                            result = _module.AddInstruction(
-                                SpirvOp.ShiftLeftLogical,
-                                _uintType,
-                                left,
-                                BitwiseAnd(right, UInt(31)));
+                            result = ShiftLeftLogical(left, right);
                             break;
                         case "SLshrB32":
                             result = ShiftRightLogical(
@@ -1113,13 +1090,7 @@ internal static partial class Gen5SpirvTranslator
                                 BitwiseAnd(right, UInt(31)));
                             break;
                         case "SAshrI32":
-                            result = Bitcast(
-                                _uintType,
-                                _module.AddInstruction(
-                                    SpirvOp.ShiftRightArithmetic,
-                                    _intType,
-                                    Bitcast(_intType, left),
-                                    BitwiseAnd(right, UInt(31))));
+                            result = ShiftRightArithmetic(left, right);
                             break;
                         case "SBfmB32":
                             result = _module.AddInstruction(
@@ -1185,11 +1156,7 @@ internal static partial class Gen5SpirvTranslator
                         {
                             var shift = (uint)(instruction.Opcode[5] - '0');
                             result = IAdd(
-                                _module.AddInstruction(
-                                    SpirvOp.ShiftLeftLogical,
-                                    _uintType,
-                                    left,
-                                    UInt(shift)),
+                                ShiftLeftLogical(left, UInt(shift)),
                                 right);
                             break;
                         }
@@ -1362,14 +1329,10 @@ internal static partial class Gen5SpirvTranslator
                 var shift = _module.AddInstruction(
                     SpirvOp.UConvert,
                     _ulongType,
-                    BitwiseAnd(GetRawSource(instruction, 1), UInt(63)));
-                var shiftedValue = _module.AddInstruction(
-                    instruction.Opcode == "SLshlB64"
-                        ? SpirvOp.ShiftLeftLogical
-                        : SpirvOp.ShiftRightLogical,
-                    _ulongType,
-                    left,
-                    shift);
+                    GetRawSource(instruction, 1));
+                var shiftedValue = instruction.Opcode == "SLshlB64"
+                    ? ShiftLeftLogical64(left, shift)
+                    : ShiftRightLogical64(left, shift);
                 StoreS64(destination, shiftedValue);
                 Store(_scc, IsNotZero64(shiftedValue));
                 return true;
@@ -1398,21 +1361,71 @@ internal static partial class Gen5SpirvTranslator
                     _uintType,
                     requestedWidth,
                     remaining);
-                var extracted = instruction.Opcode == "SBfeI64"
-                    ? Bitcast(
+                var offset64 = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    offset);
+                var width64 = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    width);
+                var one64 = _module.Constant64(_ulongType, 1);
+                var shifted = ShiftRightLogical64(left, offset64);
+                var partialMask = _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _ulongType,
+                    ShiftLeftLogical64(one64, width64),
+                    one64);
+                var fullWidth = _module.AddInstruction(
+                    SpirvOp.IEqual,
+                    _boolType,
+                    width,
+                    UInt(64));
+                var mask = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _ulongType,
+                    fullWidth,
+                    _module.Constant64(_ulongType, ulong.MaxValue),
+                    partialMask);
+                var extracted = _module.AddInstruction(
+                    SpirvOp.BitwiseAnd,
+                    _ulongType,
+                    shifted,
+                    mask);
+                if (instruction.Opcode == "SBfeI64")
+                {
+                    var signShift = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        width,
+                        UInt(1));
+                    var signBit = ShiftLeftLogical64(
+                        one64,
+                        _module.AddInstruction(
+                            SpirvOp.UConvert,
+                            _ulongType,
+                            signShift));
+                    var signExtended = _module.AddInstruction(
+                        SpirvOp.ISub,
                         _ulongType,
                         _module.AddInstruction(
-                            SpirvOp.BitFieldSExtract,
-                            _longType,
-                            Bitcast(_longType, left),
-                            offset,
-                            width))
-                    : _module.AddInstruction(
-                        SpirvOp.BitFieldUExtract,
+                            SpirvOp.BitwiseXor,
+                            _ulongType,
+                            extracted,
+                            signBit),
+                        signBit);
+                    extracted = _module.AddInstruction(
+                        SpirvOp.Select,
                         _ulongType,
-                        left,
-                        offset,
-                        width);
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            width,
+                            UInt(0)),
+                        _module.Constant64(_ulongType, 0),
+                        signExtended);
+                }
+
                 StoreS64(destination, extracted);
                 Store(_scc, IsNotZero64(extracted));
                 return true;
@@ -1615,11 +1628,7 @@ internal static partial class Gen5SpirvTranslator
                 SpirvOp.UConvert,
                 _ulongType,
                 LoadS(register + 1));
-            high = _module.AddInstruction(
-                SpirvOp.ShiftLeftLogical,
-                _ulongType,
-                high,
-                _module.Constant64(_ulongType, 32));
+            high = ShiftLeftLogical64(high, _module.Constant64(_ulongType, 32));
             return _module.AddInstruction(SpirvOp.BitwiseOr, _ulongType, low, high);
         }
 
@@ -1628,9 +1637,7 @@ internal static partial class Gen5SpirvTranslator
             StoreS(
                 register,
                 _module.AddInstruction(SpirvOp.UConvert, _uintType, value));
-            var high = _module.AddInstruction(
-                SpirvOp.ShiftRightLogical,
-                _ulongType,
+            var high = ShiftRightLogical64(
                 value,
                 _module.Constant64(_ulongType, 32));
             StoreS(
@@ -1682,12 +1689,19 @@ internal static partial class Gen5SpirvTranslator
         {
             var left = GetRawSource(instruction, reverse ? 1 : 0);
             var right = GetRawSource(instruction, reverse ? 0 : 1);
-            if (operation is
-                SpirvOp.ShiftLeftLogical or
-                SpirvOp.ShiftRightLogical or
-                SpirvOp.ShiftRightArithmetic)
+            if (operation == SpirvOp.ShiftLeftLogical)
             {
-                right = BitwiseAnd(right, UInt(31));
+                return ShiftLeftLogical(left, right);
+            }
+
+            if (operation == SpirvOp.ShiftRightLogical)
+            {
+                return ShiftRightLogical(left, right);
+            }
+
+            if (operation == SpirvOp.ShiftRightArithmetic)
+            {
+                return ShiftRightArithmetic(left, right);
             }
 
             return _module.AddInstruction(operation, _uintType, left, right);
@@ -1986,21 +2000,13 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 localLane,
                 UInt(8));
-            var lowShift = _module.AddInstruction(
-                SpirvOp.ShiftLeftLogical,
-                _uintType,
-                localLane,
-                UInt(2));
+            var lowShift = ShiftLeftLogical(localLane, UInt(2));
             var highLane = _module.AddInstruction(
                 SpirvOp.ISub,
                 _uintType,
                 localLane,
                 UInt(8));
-            var highShift = _module.AddInstruction(
-                SpirvOp.ShiftLeftLogical,
-                _uintType,
-                highLane,
-                UInt(2));
+            var highShift = ShiftLeftLogical(highLane, UInt(2));
             var lowSelector = BitwiseAnd(
                 ShiftRightLogical(selectorLow, lowShift),
                 UInt(15));

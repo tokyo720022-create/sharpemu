@@ -14,6 +14,7 @@ internal static class Gen5ShaderScalarEvaluator
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
     private const int MaxGlobalMemoryBindingBytes = 16 * 1024 * 1024;
+    private const ulong RdnaWaveMask = 0xFFFF_FFFFUL;
 
     private readonly record struct BufferDescriptor(
         ulong BaseAddress,
@@ -41,7 +42,8 @@ internal static class Gen5ShaderScalarEvaluator
         CpuContext ctx,
         Gen5ShaderState state,
         out Gen5ShaderEvaluation evaluation,
-        out string error)
+        out string error,
+        bool resolveVertexInputs = false)
     {
         evaluation = default!;
         error = string.Empty;
@@ -60,14 +62,15 @@ internal static class Gen5ShaderScalarEvaluator
             computeSystemRegisters.ClearStaticValues(scalarRegisters);
         }
 
-        var execMask = ulong.MaxValue;
-        WriteScalarPair(scalarRegisters, 106, ulong.MaxValue, ref execMask);
+        var execMask = RdnaWaveMask;
+        WriteScalarPair(scalarRegisters, 106, 0, ref execMask);
         WriteScalarPair(scalarRegisters, 126, execMask, ref execMask);
         var initialScalarRegisters = (uint[])scalarRegisters.Clone();
 
         var resolved = new List<Gen5ImageBinding>();
         var globalMemoryBindings = new List<Gen5GlobalMemoryBinding>();
         var globalMemoryByAddress = new Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding>();
+        var vertexInputBindings = new List<Gen5VertexInputBinding>();
         var runtimeScalarRegisters = CollectRuntimeScalarRegisters(state.Program);
         var scalarRegisterSnapshots = new Dictionary<uint, IReadOnlyList<uint>>();
         var scalarConditionCode = false;
@@ -248,6 +251,42 @@ internal static class Gen5ShaderScalarEvaluator
                     return false;
                 }
 
+                if (resolveVertexInputs &&
+                    IsVertexFetchCandidate(instruction, bufferMemory, bufferDescriptor))
+                {
+                    if (!TryReadGlobalMemory(
+                            ctx,
+                            bufferDescriptor.BaseAddress,
+                            bufferDescriptor.SizeBytes,
+                            out var vertexData))
+                    {
+                        error =
+                            $"vertex-buffer-read-failed pc=0x{instruction.Pc:X} " +
+                            $"address=0x{bufferDescriptor.BaseAddress:X16} " +
+                            $"bytes={bufferDescriptor.SizeBytes} " +
+                            $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords}";
+                        return false;
+                    }
+
+                    if (!TryCreateVertexInputBinding(
+                            instruction,
+                            bufferMemory,
+                            bufferDescriptor,
+                            vertexData,
+                            (uint)vertexInputBindings.Count,
+                            scalarRegisters,
+                            out var vertexInputBinding))
+                    {
+                        error =
+                            $"vertex-input-binding-failed pc=0x{instruction.Pc:X} " +
+                            $"s{bufferMemory.ScalarResource}";
+                        return false;
+                    }
+
+                    vertexInputBindings.Add(vertexInputBinding);
+                    continue;
+                }
+
                 var key = (bufferMemory.ScalarResource, bufferDescriptor.BaseAddress);
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
@@ -339,9 +378,50 @@ internal static class Gen5ShaderScalarEvaluator
             resolved,
             globalMemoryBindings,
             state.ComputeSystemRegisters,
-            runtimeScalarRegisters);
+            runtimeScalarRegisters,
+            vertexInputBindings);
         return true;
     }
+
+    private static bool TryCreateVertexInputBinding(
+        Gen5ShaderInstruction instruction,
+        Gen5BufferMemoryControl control,
+        BufferDescriptor descriptor,
+        byte[] data,
+        uint location,
+        uint[] scalarRegisters,
+        out Gen5VertexInputBinding binding)
+    {
+        binding = default!;
+        if (!IsVertexFetchCandidate(instruction, control, descriptor) ||
+            instruction.Sources.Count <= 2 ||
+            !TryEvaluateScalarOperand(instruction.Sources[2], scalarRegisters, out var scalarOffset))
+        {
+            return false;
+        }
+
+        binding = new Gen5VertexInputBinding(
+            instruction.Pc,
+            location,
+            control.DwordCount,
+            descriptor.BaseAddress,
+            descriptor.Stride,
+            unchecked((uint)control.OffsetBytes + scalarOffset),
+            data);
+        return true;
+    }
+
+    private static bool IsVertexFetchCandidate(
+        Gen5ShaderInstruction instruction,
+        Gen5BufferMemoryControl control,
+        BufferDescriptor descriptor) =>
+        control.IndexEnabled &&
+        !control.OffsetEnabled &&
+        control.DwordCount is >= 1 and <= 4 &&
+        descriptor.BaseAddress != 0 &&
+        descriptor.Stride != 0 &&
+        (instruction.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal) ||
+         instruction.Opcode.StartsWith("TBufferLoadFormat", StringComparison.Ordinal));
 
     private static HashSet<uint> CollectRuntimeScalarRegisters(Gen5ShaderProgram program)
     {
@@ -950,9 +1030,9 @@ internal static class Gen5ShaderScalarEvaluator
         };
 
         WriteScalarPair(registers, destination.Value, oldExec, ref execMask);
-        execMask = newExec;
+        execMask = MaskWaveValue(newExec);
         WriteScalarPair(registers, 126, execMask, ref execMask);
-        scalarConditionCode = newExec != 0;
+        scalarConditionCode = execMask != 0;
         return true;
     }
 
@@ -1000,6 +1080,11 @@ internal static class Gen5ShaderScalarEvaluator
             return;
         }
 
+        if (destination == 126)
+        {
+            value = MaskWaveValue(value);
+        }
+
         registers[destination] = (uint)value;
         registers[destination + 1] = (uint)(value >> 32);
         if (destination == 126)
@@ -1007,6 +1092,8 @@ internal static class Gen5ShaderScalarEvaluator
             execMask = value;
         }
     }
+
+    private static ulong MaskWaveValue(ulong value) => value & RdnaWaveMask;
 
     private static bool TryExecuteScalarCompare(
         Gen5ShaderInstruction instruction,
