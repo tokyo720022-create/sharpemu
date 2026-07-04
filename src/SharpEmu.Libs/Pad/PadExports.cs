@@ -232,13 +232,13 @@ public static class PadExports
         // Face buttons
         if (IsKeyDown(0x5A) || IsKeyDown(0x0D)) buttons |= 0x4000; // Z / Enter = Cross
         if (IsKeyDown(0x58) || IsKeyDown(0x1B)) buttons |= 0x2000; // X / Escape = Circle
-        if (IsKeyDown(0x43))                     buttons |= 0x8000; // C = Square
-        if (IsKeyDown(0x56))                     buttons |= 0x1000; // V = Triangle
+        if (IsKeyDown(0x43)) buttons |= 0x8000; // C = Square
+        if (IsKeyDown(0x56)) buttons |= 0x1000; // V = Triangle
         // Shoulder buttons
-        if (IsKeyDown(0x51))                     buttons |= 0x0400; // Q = L1
-        if (IsKeyDown(0x45))                     buttons |= 0x0800; // E = R1
-        if (IsKeyDown(0x52))                     buttons |= 0x0100; // R = L2 (digital)
-        if (IsKeyDown(0x46))                     buttons |= 0x0200; // F = R2 (digital)
+        if (IsKeyDown(0x51)) buttons |= 0x0400; // Q = L1
+        if (IsKeyDown(0x45)) buttons |= 0x0800; // E = R1
+        if (IsKeyDown(0x52)) buttons |= 0x0100; // R = L2 (digital)
+        if (IsKeyDown(0x46)) buttons |= 0x0200; // F = R2 (digital)
         // Options (Start)
         if (IsKeyDown(0x09) || IsKeyDown(0x08)) buttons |= 0x0008; // Tab / Backspace = Options
         return buttons;
