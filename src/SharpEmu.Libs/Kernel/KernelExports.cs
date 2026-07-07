@@ -366,6 +366,13 @@ public static class KernelExports
     public static int KernelOpen(CpuContext ctx) => KernelMemoryCompatExports.KernelOpenUnderscore(ctx);
 
     [SysAbiExport(
+        Nid = "mqQMh1zPPT8",
+        ExportName = "fstat",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int Fstat(CpuContext ctx) => KernelMemoryCompatExports.KernelFstat(ctx);
+
+    [SysAbiExport(
         Nid = "hcuQgD53UxM",
         ExportName = "printf",
         Target = Generation.Gen4 | Generation.Gen5,

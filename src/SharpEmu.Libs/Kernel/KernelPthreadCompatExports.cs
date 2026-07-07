@@ -96,6 +96,13 @@ public static class KernelPthreadCompatExports
     }
 
     [SysAbiExport(
+        Nid = "7Xl257M4VNI",
+        ExportName = "pthread_equal",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int PosixPthreadEqual(CpuContext ctx) => PthreadEqual(ctx);
+
+    [SysAbiExport(
         Nid = "T72hz6ffq08",
         ExportName = "scePthreadYield",
         Target = Generation.Gen4 | Generation.Gen5,
