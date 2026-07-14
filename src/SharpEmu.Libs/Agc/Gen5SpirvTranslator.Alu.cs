@@ -861,6 +861,25 @@ internal static partial class Gen5SpirvTranslator
             {
                 condition = _module.ConstantBool(true);
             }
+            else if (opcode is "VCmpOF32" or "VCmpxOF32" or "VCmpUF32" or "VCmpxUF32")
+            {
+                // The ordered/unordered predicates only test whether either
+                // operand is NaN. SPIR-V's OpOrdered/OpUnordered are Kernel-only,
+                // so build the same result from OpIsNan, which needs no extra
+                // capability: unordered = isnan(a) || isnan(b), ordered = !that.
+                var left = GetFloatSource(instruction, 0);
+                var right = GetFloatSource(instruction, 1);
+                var nanLeft = _module.AddInstruction(SpirvOp.IsNan, _boolType, left);
+                var nanRight = _module.AddInstruction(SpirvOp.IsNan, _boolType, right);
+                var unordered = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    nanLeft,
+                    nanRight);
+                condition = opcode is "VCmpUF32" or "VCmpxUF32"
+                    ? unordered
+                    : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered);
+            }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32") &&
                      opcode.EndsWith("F32", StringComparison.Ordinal))
             {
@@ -875,6 +894,7 @@ internal static partial class Gen5SpirvTranslator
                     "VCmpLgF32" or "VCmpxLgF32" => SpirvOp.FOrdNotEqual,
                     "VCmpGeF32" or "VCmpxGeF32" => SpirvOp.FOrdGreaterThanEqual,
                     "VCmpNeqF32" or "VCmpxNeqF32" => SpirvOp.FUnordNotEqual,
+                    "VCmpNlgF32" or "VCmpxNlgF32" => SpirvOp.FUnordEqual,
                     "VCmpNltF32" or "VCmpxNltF32" => SpirvOp.FUnordGreaterThanEqual,
                     "VCmpNleF32" or "VCmpxNleF32" => SpirvOp.FUnordGreaterThan,
                     "VCmpNgtF32" or "VCmpxNgtF32" => SpirvOp.FUnordLessThanEqual,
@@ -925,7 +945,8 @@ internal static partial class Gen5SpirvTranslator
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
 
-            StoreWaveMask(106, condition);
+            // On gfx10, VCmpx writes EXEC only and preserves VCC; the sdst
+            // operand was removed from the cmpx encodings on this generation.
             if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
             {
                 var active = _module.AddInstruction(
@@ -934,6 +955,10 @@ internal static partial class Gen5SpirvTranslator
                     Load(_boolType, _exec),
                     condition);
                 StoreWaveMask(126, active);
+            }
+            else
+            {
+                StoreWaveMask(106, condition);
             }
 
             return true;
