@@ -7,6 +7,9 @@
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
@@ -43,6 +46,9 @@ struct se_gpu_backend {
     VkSemaphore image_available{}, render_finished{}; VkFence frame_fence{};
     VkBuffer staging{}; VkDeviceMemory staging_memory{}; void* staging_map{};
     VkDeviceSize staging_capacity{}; bool resized{};
+    std::string base_title{"SharpEmu"};
+    std::chrono::steady_clock::time_point fps_sample_started{std::chrono::steady_clock::now()};
+    uint64_t fps_sample_frames{}; bool fps_counter_enabled{true};
     std::unordered_map<uint64_t, guest_image> guest_images;
     std::unordered_map<uint64_t, uint32_t> display_formats;
     std::vector<host_buffer> buffer_pool;
@@ -92,6 +98,20 @@ void cleanup(se_gpu_backend* b) {
 se_gpu_result abandon(se_gpu_backend* b, se_gpu_result result, std::string message) {
     cleanup(b);
     return fail(nullptr, result, std::move(message));
+}
+
+void record_presented_frame(se_gpu_backend* b) {
+    if (!b->fps_counter_enabled) return;
+    ++b->fps_sample_frames;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - b->fps_sample_started).count();
+    if (seconds < 0.5) return;
+    const double fps = static_cast<double>(b->fps_sample_frames) / seconds;
+    char title[256]{};
+    std::snprintf(title, sizeof(title), "FPS %.1f | %s", fps, b->base_title.c_str());
+    SDL_SetWindowTitle(b->window, title);
+    b->fps_sample_frames = 0;
+    b->fps_sample_started = now;
 }
 
 uint32_t memory_type(se_gpu_backend* b, uint32_t bits, VkMemoryPropertyFlags required) {
@@ -411,10 +431,16 @@ se_gpu_result present_image(se_gpu_backend* b, guest_image* source) {
     present.waitSemaphoreCount = 1; present.pWaitSemaphores = &b->render_finished;
     present.swapchainCount = 1; present.pSwapchains = &b->swapchain; present.pImageIndices = &image_index;
     VkResult result = vkQueuePresentKHR(b->queue, &present);
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) { b->resized = true; return SE_GPU_OK; }
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        b->resized = true;
+        if (result == VK_SUBOPTIMAL_KHR) record_presented_frame(b);
+        return SE_GPU_OK;
+    }
     if (result != VK_SUCCESS) return fail(b, SE_GPU_VULKAN_ERROR, "guest image present failed");
-    return vkWaitForFences(b->device, 1, &b->frame_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS ? SE_GPU_OK :
-        fail(b, SE_GPU_VULKAN_ERROR, "guest image presentation completion failed");
+    if (vkWaitForFences(b->device, 1, &b->frame_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return fail(b, SE_GPU_VULKAN_ERROR, "guest image presentation completion failed");
+    record_presented_frame(b);
+    return SE_GPU_OK;
 }
 
 se_gpu_result create_commands(se_gpu_backend* b) {
@@ -673,6 +699,9 @@ se_gpu_result SE_GPU_CALL se_gpu_create(const se_gpu_create_info* info, se_gpu_b
     auto* b = new (std::nothrow) se_gpu_backend{};
     if (!b) return fail(nullptr, SE_GPU_OUT_OF_MEMORY, "native GPU backend allocation failed");
     b->log = info->log; b->log_user = info->log_user;
+    b->base_title = info->title_utf8 ? info->title_utf8 : "SharpEmu";
+    const char* perf_hud = std::getenv("SHARPEMU_PERF_HUD");
+    b->fps_counter_enabled = !perf_hud || std::strcmp(perf_hud, "0") != 0;
     // SharpEmu owns the process entry point (and is a WinExe on Windows), so
     // SDL never gets its usual SDL_main bootstrap. Mark the host entry point
     // ready before initializing video from the dedicated renderer thread.
@@ -846,8 +875,14 @@ se_gpu_result SE_GPU_CALL se_gpu_present_bgra(
     info.waitSemaphoreCount = 1; info.pWaitSemaphores = &b->render_finished;
     info.swapchainCount = 1; info.pSwapchains = &b->swapchain; info.pImageIndices = &image_index;
     result = vkQueuePresentKHR(b->queue, &info);
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) { b->resized = true; return SE_GPU_OK; }
-    return result == VK_SUCCESS ? SE_GPU_OK : fail(b, SE_GPU_VULKAN_ERROR, "queue present failed");
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        b->resized = true;
+        if (result == VK_SUBOPTIMAL_KHR) record_presented_frame(b);
+        return SE_GPU_OK;
+    }
+    if (result != VK_SUCCESS) return fail(b, SE_GPU_VULKAN_ERROR, "queue present failed");
+    record_presented_frame(b);
+    return SE_GPU_OK;
 }
 se_gpu_result SE_GPU_CALL se_gpu_submit_draw(se_gpu_backend* b, const se_gpu_draw* work) {
     if (!b || !work || work->struct_size < sizeof(*work) || !work->pixel_spirv.data ||
