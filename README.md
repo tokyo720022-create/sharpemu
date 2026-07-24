@@ -27,7 +27,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 <p align="center">
   <a href="#support">
-    <img src="https://img.shields.io/badge/Support-GitHub%20Sponsors%20%26%20Crypto-EA4AAA?style=for-the-badge&logo=githubsponsors& logoColor=white" alt="Support SharpEmu">
+    <img src="https://img.shields.io/badge/Support-GitHub%20Sponsors%20%26%20Crypto-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Support SharpEmu">
   </a>
 </p>
 
